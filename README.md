@@ -2,7 +2,7 @@
 
 **An exploratory, reproducible R/Quarto analysis of repeated binary respiratory-status measurements.** The project demonstrates why visit-by-visit hypothesis tests need a stated multiplicity strategy, and why repeated observations from the same person call for a longitudinal model.
 
-> **Read the analysis:** [Open the full Quarto report](LINK_TO_RENDERED_REPORT)
+> **Read the analysis:** [Open the full Quarto report](https://github.com/ModelLearnRepeat/respiratory-multiple-testing/blob/main/analyse.qmd)
 
 ## Questions
 
