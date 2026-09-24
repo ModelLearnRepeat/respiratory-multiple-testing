@@ -1,0 +1,2302 @@
+---
+title: "Multiple Testing und longitudinale Atemwegsdaten"
+subtitle: "Analyse eines klinischen Datensatzes mit wiederholten Messungen"
+author: ""
+format:
+  html:
+    toc: true
+    code-fold: true
+    number-sections: true
+---
+
+# Fragestellung
+
+Dieses Projekt untersucht, wie mehrere statistische Tests bei wiederholten
+medizinischen Messungen ausgewertet werden können.
+
+Wir vergleichen die Verfahren Bonferroni, Holm, Benjamini-Hochberg und
+Benjamini-Yekutieli. Zusätzlich wird ein gemeinsames Längsschnittmodell
+für wiederholte binäre Messungen vorbereitet.
+
+# Mathematische Grundlagen
+
+Dieser Abschnitt wird nach der Datenprüfung ergänzt.
+
+# Datenquelle und Studiendesign
+
+Wir verwenden den öffentlich verfügbaren Datensatz `respiratory`
+aus dem R-Paket `geepack`.
+
+Der Datensatz stammt aus einer klinischen Studie mit 111 Personen aus
+zwei Kliniken. Die Personen wurden randomisiert einer aktiven Behandlung
+oder einem Placebo zugeordnet. Der Atemwegsstatus wurde zu vier
+Nachuntersuchungen erhoben und als binäre Variable codiert:
+
+- 1 = guter Atemwegsstatus
+- 0 = schlechter Atemwegsstatus
+
+Da dieselben Personen mehrfach untersucht wurden, sind die Beobachtungen
+innerhalb einer Person nicht als unabhängig zu behandeln. Diese
+Abhängigkeit wird später im Längsschnittmodell berücksichtigt.
+
+Der Datensatz wird direkt aus dem R-Paket geladen. Es werden keine
+individuellen Patientendaten in das Repository hochgeladen.
+```{r}
+#| label: setup
+
+library(geepack)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+data("respiratory", package = "geepack")
+```
+
+
+
+# Datenprüfung
+
+Zuerst prüfen wir Umfang, Variablennamen und Datentypen.
+
+```{r}
+dim(respiratory)
+names(respiratory)
+str(respiratory)
+head(respiratory)
+summary(respiratory)
+```
+
+## Prüfung der Personenkennungen
+
+Die Variable `id` ist innerhalb der Kliniken nicht global eindeutig.
+Deshalb kombinieren wir `center` und `id` zu einer eindeutigen
+Personenkennung.
+
+```{r}
+respiratory <- respiratory %>%
+  mutate(
+    person_id = interaction(center, id, drop = TRUE)
+  )
+
+n_distinct(respiratory$person_id)
+```
+
+```{r}
+respiratory %>%
+  count(person_id, name = "messungen_pro_person") %>%
+  count(
+    messungen_pro_person,
+    name = "anzahl_personen"
+  )
+```
+
+```{r}
+respiratory %>%
+  summarise(
+    anzahl_personen = n_distinct(person_id),
+    anzahl_messungen = n(),
+    minimale_messungen_pro_person = min(table(person_id)),
+    maximale_messungen_pro_person = max(table(person_id)),
+    alle_personen_mit_vier_messungen =
+      all(table(person_id) == 4)
+  )
+```
+## Werte des Outcomes
+
+```{r}
+table(respiratory$outcome, useNA = "ifany")
+table(respiratory$treat, respiratory$outcome, useNA = "ifany")
+```
+
+## Prüfung der Personenkennungen
+
+```{r}
+respiratory %>%
+  count(center, id) %>%
+  summarise(
+    anzahl_personen = n(),
+    maximale_messungen_pro_person = max(n),
+    minimale_messungen_pro_person = min(n)
+  )
+```
+
+### Interpretation der Datenstruktur
+
+Die Daten enthalten 444 Beobachtungen. Die Variable `visit` umfasst vier
+Untersuchungszeitpunkte, und die Prüfung zeigt, dass 111 Personen jeweils
+genau vier Beobachtungen besitzen:
+
+\[
+111 \text{ Personen} \times 4 \text{ Untersuchungszeitpunkte}
+= 444 \text{ Beobachtungen}.
+\]
+
+Die Variable `id` ist allein nicht eindeutig, weil dieselbe ID in
+verschiedenen Kliniken vorkommen kann. Deshalb kombinieren wir `center`
+und `id` zu `person_id`. Diese Kombination identifiziert eine Person
+eindeutig innerhalb des Datensatzes.
+
+Die vier Zeilen einer Person beziehen sich daher auf wiederholte
+Untersuchungen derselben Person. Sie sind keine vier verschiedenen
+Patientinnen oder Patienten. Der Gesundheitszustand einer Person zu einem
+Zeitpunkt kann mit ihrem Gesundheitszustand zu einem späteren Zeitpunkt
+zusammenhängen. Beispielsweise ist es plausibel, dass eine Person mit
+einem guten Status beim ersten Besuch auch beim nächsten Besuch eher einen
+guten Status hat.
+
+Aus der Datenstruktur folgt deshalb eine mögliche Abhängigkeit der
+Messungen innerhalb einer Person. Die Beobachtungen verschiedener
+Personen bilden dagegen die unabhängigen Untersuchungseinheiten, sofern
+das Studiendesign diese Annahme rechtfertigt.
+
+Diese Unterscheidung hat direkte Konsequenzen für die Analyse:
+
+- Wir dürfen die 444 Zeilen nicht wie 444 unabhängige Personen behandeln.
+- Ein Modell, das die wiederholten Messungen ignoriert, kann seine
+  Standardfehler zu klein schätzen.
+- Dadurch können Konfidenzintervalle zu eng und p-Werte zu klein werden.
+- Ein scheinbar signifikanter Behandlungseffekt könnte dann zu optimistisch
+  bewertet werden.
+- Im weiteren Verlauf berücksichtigen wir deshalb die Personen als Cluster
+  und verwenden ein Längsschnittmodell, beispielsweise ein GEE-Modell.
+- Die Korrektur für multiples Testen ist davon getrennt: Sie kontrolliert
+  die Fehler durch mehrere Hypothesen, korrigiert aber kein falsch
+  spezifiziertes Modell für wiederholte Messungen.
+
+Die Prüfung zeigt außerdem, dass jede Person vier Messungen besitzt. In
+diesem Datensatz gibt es daher keine fehlenden Nachuntersuchungen innerhalb
+der vier vorgesehenen Besuche. Diese Prüfung beweist jedoch nicht, dass
+die Messungen tatsächlich unabhängig zwischen verschiedenen Personen
+sind oder dass alle übrigen Modellannahmen erfüllt sind.
+
+
+# Deskriptive Analyse
+
+## Verteilung von Alter und Geschlecht
+
+Das Alter reicht in der Stichprobe von 11 bis 68 Jahren. Außerdem sind
+352 Männer und 92 Frauen enthalten. Das Geschlechterverhältnis ist daher
+unausgeglichen.
+
+Diese Verteilung beschreibt zunächst nur die vorliegende Stichprobe. Sie
+beweist weder eine fehlende Repräsentativität für eine bestimmte
+Zielpopulation noch eine Verzerrung des Behandlungseffekts. Für die
+Analyse ist entscheidend, ob Alter und Geschlecht zwischen den
+Behandlungsgruppen unterschiedlich verteilt sind und ob sie mit dem
+Atemwegsstatus zusammenhängen.
+
+Wir untersuchen deshalb die Verteilung dieser Variablen nach
+Behandlungsgruppe und berücksichtigen sie bei Bedarf als Kovariaten im
+Längsschnittmodell.
+
+```{r}
+respiratory %>%
+  distinct(person_id, .keep_all = TRUE) %>%
+  group_by(treat) %>%
+  summarise(
+    personen = n(),
+    alter_mittelwert = mean(age),
+    alter_median = median(age),
+    alter_sd = sd(age),
+    alter_minimum = min(age),
+    alter_maximum = max(age),
+    .groups = "drop"
+  )
+```
+
+```{r}
+respiratory %>%
+  distinct(person_id, .keep_all = TRUE) %>%
+  count(treat, sex) %>%
+  group_by(treat) %>%
+  mutate(
+    anteil = n / sum(n)
+  )
+```
+
+```{r}
+ggplot(
+  respiratory %>%
+    distinct(person_id, .keep_all = TRUE),
+  aes(x = treat, y = age, fill = treat)
+) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(
+    width = 0.12,
+    alpha = 0.35,
+    height = 0
+  ) +
+  scale_x_discrete(
+    labels = c(
+      A = "Aktive Behandlung",
+      P = "Placebo"
+    )
+  ) +
+  labs(
+    x = "Behandlungsgruppe",
+    y = "Alter in Jahren",
+    title = "Altersverteilung nach Behandlungsgruppe"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r}
+ggplot(
+  respiratory %>%
+    distinct(person_id, .keep_all = TRUE),
+  aes(x = age)
+) +
+  geom_histogram(
+    binwidth = 5,
+    boundary = 0,
+    color = "white",
+    fill = "#1B6CA8"
+  ) +
+  labs(
+    x = "Alter in Jahren",
+    y = "Anzahl Personen",
+    title = "Altersverteilung der Studienteilnehmenden"
+  ) +
+  theme_minimal()
+```
+
+### Interpretation der deskriptiven Ergebnisse
+
+Die Stichprobe umfasst 111 Personen mit jeweils vier Untersuchungszeitpunkten. 
+Die beiden Behandlungsgruppen sind hinsichtlich ihrer Größe vergleichbar 
+(aktive Behandlung: 54 Personen; Placebo: 57 Personen).
+
+Das Alter reicht von 11 bis 68 Jahren. Der mittlere Alterswert ist in der 
+aktiven Behandlungsgruppe ähnlich wie in der Placebogruppe 
+(32,9 gegenüber 33,6 Jahren). Auch die Standardabweichungen und die 
+Altersbereiche sind vergleichbar. Deskriptiv gibt es daher keinen deutlichen 
+Hinweis auf eine relevante Altersverschiebung zwischen den Gruppen.
+
+Die Geschlechtsverteilung ist dagegen unausgewogen. In der aktiven 
+Behandlungsgruppe sind 6 von 54 Personen weiblich, in der Placebogruppe 
+17 von 57 Personen. Diese Verteilung beschreibt zunächst nur die beobachtete 
+Stichprobe. Sie beweist weder eine fehlende Repräsentativität noch eine 
+Verzerrung des Behandlungseffekts.
+
+Für die weitere Analyse ist jedoch wichtig, dass Geschlecht und Alter 
+möglicherweise mit dem Atemwegsstatus zusammenhängen können. Deshalb prüfen 
+wir im nächsten Schritt, ob diese Variablen zusätzlich zum Behandlungseffekt 
+mit dem Outcome assoziiert sind. Falls dies fachlich und statistisch 
+begründet ist, werden sie als Kovariaten im GEE-Modell berücksichtigt.
+
+Medizinisch bedeutet dies: Die Gruppen sind hinsichtlich des Alters 
+vergleichbar, unterscheiden sich aber deutlich in ihrer Geschlechtsverteilung. 
+Ein beobachteter Unterschied im Atemwegsstatus sollte daher nicht automatisch 
+ausschließlich der Behandlung zugeschrieben werden, ohne mögliche 
+Einflussfaktoren zu berücksichtigen.
+
+Für Recruiter zeigt dieser Schritt, dass die Daten nicht nur tabellarisch 
+beschrieben wurden. Die Verteilung relevanter Patientenmerkmale wurde geprüft, 
+mögliche Confounder wurden erkannt und ihre Bedeutung für die nachfolgende 
+Modellierung wurde ausdrücklich berücksichtigt.
+
+## Deskriptive Verteilung des Outcomes
+
+Der Zielparameter ist der Atemwegsstatus. Wir verwenden folgende Kodierung:
+
+- `outcome = 1`: guter Atemwegsstatus
+- `outcome = 0`: schlechter Atemwegsstatus
+
+Zunächst beschreiben wir den beobachteten Anteil guter Atemwegszustände in jeder Behandlungsgruppe und zu jedem Untersuchungszeitpunkt. Diese Anteile sind rein deskriptiv. Sie berücksichtigen weder die wiederholten Messungen innerhalb derselben Person noch mögliche Einflussfaktoren wie Alter oder Geschlecht.
+
+Die deskriptive Auswertung ist dennoch wichtig, weil sie zeigt, wie sich der beobachtete Atemwegsstatus über die Zeit entwickelt und ob sich erste Unterschiede zwischen den Behandlungsgruppen erkennen lassen.
+
+```{r}
+deskriptiv_outcome <- respiratory %>%
+  group_by(treat, visit) %>%
+  summarise(
+    personen = n_distinct(person_id),
+    beobachtungen = n(),
+    guter_status = sum(outcome == 1, na.rm = TRUE),
+    schlechter_status = sum(outcome == 0, na.rm = TRUE),
+    anteil_guter_status = guter_status / beobachtungen,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    anteil_prozent = 100 * anteil_guter_status
+  )
+
+deskriptiv_outcome
+```
+
+### Lesbare Ergebnistabelle
+
+```{r}
+deskriptiv_outcome %>%
+  mutate(
+    Behandlung = case_when(
+      treat == "A" ~ "Aktive Behandlung",
+      treat == "P" ~ "Placebo",
+      TRUE ~ as.character(treat)
+    ),
+    Besuch = paste("Besuch", visit)
+  ) %>%
+  select(
+    Behandlung,
+    Besuch,
+    personen,
+    beobachtungen,
+    guter_status,
+    schlechter_status,
+    anteil_prozent
+  )
+```
+
+### Zeitlicher Verlauf des Outcomes
+
+Die beobachteten Anteile werden anschließend grafisch über die vier 
+Untersuchungszeitpunkte dargestellt. Dadurch können mögliche Unterschiede 
+zwischen den Behandlungsgruppen und Veränderungen über die Zeit übersichtlich 
+erkannt werden.
+
+```{r}
+ggplot(
+  deskriptiv_outcome,
+  aes(
+    x = visit,
+    y = anteil_guter_status,
+    color = treat,
+    group = treat
+  )
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(
+    breaks = 1:4,
+    labels = paste("Besuch", 1:4)
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  scale_color_manual(
+    values = c(
+      A = "#1B6CA8",
+      P = "#D97904"
+    ),
+    labels = c(
+      A = "Aktive Behandlung",
+      P = "Placebo"
+    )
+  ) +
+  labs(
+    x = "Untersuchungszeitpunkt",
+    y = "Anteil mit gutem Atemwegsstatus",
+    color = "Behandlungsgruppe",
+    title = "Beobachteter Atemwegsstatus nach Behandlung und Besuch"
+  ) +
+  theme_minimal()
+```
+
+### Einordnung der deskriptiven Ergebnisse
+
+Die Tabelle und die Grafik zeigen die beobachteten Anteile guter 
+Atemwegszustände in den beiden Behandlungsgruppen zu den vier 
+Untersuchungszeitpunkten.
+
+Ein höherer Anteil bedeutet, dass in der jeweiligen Gruppe zu diesem 
+Zeitpunkt mehr Personen einen guten Atemwegsstatus aufwiesen. Die Grafik 
+beschreibt damit den zeitlichen Verlauf des Outcomes und ermöglicht einen 
+ersten deskriptiven Vergleich zwischen aktiver Behandlung und Placebo.
+
+Ein Abstand zwischen den Linien ist zunächst nur ein beobachteter Unterschied. 
+Er beweist noch keinen Behandlungseffekt. Die Darstellung berücksichtigt 
+außerdem noch nicht vollständig, dass dieselben Personen mehrfach untersucht 
+wurden. Die vier Messungen einer Person können voneinander abhängig sein.
+
+Deshalb dürfen die beobachteten Unterschiede nicht mit einem gewöhnlichen 
+Test für unabhängige Beobachtungen bewertet werden. Im nächsten Schritt 
+führen wir zeitpunktbezogene Gruppenvergleiche durch und berücksichtigen 
+dabei das Problem des multiplen Testens. Anschließend verwenden wir ein 
+GEE-Modell, das die Abhängigkeit der wiederholten Messungen innerhalb einer 
+Person berücksichtigt.
+
+Medizinisch beschreibt diese Analyse, ob sich der Anteil der Patientinnen und 
+Patienten mit gutem Atemwegsstatus im Verlauf zwischen den Behandlungen 
+unterscheidet. Sie liefert eine erste Orientierung, aber noch keine 
+adjustierte oder endgültige Aussage über die Wirksamkeit der Behandlung.
+
+### Interpretation der beobachteten Outcome-Verteilung
+
+In der aktiven Behandlungsgruppe lag der Anteil eines guten 
+Atemwegsstatus bei 68,5 % beim ersten Besuch, 70,4 % beim zweiten Besuch 
+und 72,2 % beim dritten Besuch. Beim vierten Besuch sank der Anteil auf 
+61,1 %.
+
+In der Placebogruppe betrugen die entsprechenden Anteile 49,1 %, 38,6 %, 
+45,6 % und 43,9 %. Die aktive Behandlungsgruppe weist damit zu jedem 
+Untersuchungszeitpunkt deskriptiv einen höheren Anteil guter 
+Atemwegszustände auf.
+
+Der größte beobachtete Unterschied besteht beim zweiten Besuch. Dort liegt 
+der Anteil in der aktiven Behandlungsgruppe um ungefähr 31,8 Prozentpunkte 
+über dem Anteil in der Placebogruppe. Beim vierten Besuch beträgt der 
+deskriptive Unterschied ungefähr 17,2 Prozentpunkte.
+
+#### Statistische Bedeutung
+
+Diese Werte sind beobachtete Gruppenanteile. Sie beschreiben, wie häufig ein 
+guter Atemwegsstatus in den jeweiligen Gruppen vorkam. Sie sind noch keine 
+Schätzung eines adjustierten Behandlungseffekts und erlauben allein keine 
+Aussage über statistische Signifikanz oder Kausalität.
+
+Außerdem stammen die vier Beobachtungen jeweils von denselben Personen. Die 
+Messungen innerhalb einer Person können daher abhängig sein. Die 
+Unterschiede dürfen deshalb nicht so behandelt werden, als wären alle 444 
+Beobachtungen unabhängig voneinander.
+
+#### Medizinische Bedeutung
+
+Deskriptiv weist die aktive Behandlung während aller vier Besuche auf einen 
+höheren Anteil guter Atemwegszustände hin. Dies könnte auf einen günstigeren 
+Verlauf unter der aktiven Behandlung hindeuten. Die Schwankungen über die 
+Besuchszeitpunkte zeigen jedoch, dass der beobachtete Verlauf nicht völlig 
+konstant ist.
+
+Aus diesen Anteilen allein kann noch nicht geschlossen werden, dass die 
+Behandlung den Atemwegsstatus tatsächlich verbessert. Dafür müssen die 
+Abhängigkeit der wiederholten Messungen, die statistische Unsicherheit und 
+mögliche Einflussfaktoren berücksichtigt werden.
+
+#### Konsequenz für die weitere Analyse
+
+Die deskriptiven Unterschiede liefern die Grundlage für die nächsten 
+Analyseschritte. Wir führen zunächst zeitpunktbezogene Gruppenvergleiche 
+durch. Da dabei mehrere Hypothesen gleichzeitig geprüft werden, kontrollieren 
+wir anschließend die Fehler durch multiples Testen.
+
+Für die Hauptanalyse verwenden wir danach ein GEE-Modell. Dieses Modell 
+berücksichtigt, dass die vier Messungen einer Person miteinander korreliert 
+sein können. Alter und Geschlecht werden nur dann als Kovariaten 
+aufgenommen, wenn ihre mögliche Bedeutung für den Atemwegsstatus fachlich 
+und statistisch begründet ist.
+
+#### Einordnung für medizinische Leserinnen und Leser und Recruiter
+
+Die deskriptive Analyse zeigt einen konsistent höheren beobachteten Anteil 
+guter Atemwegszustände in der aktiven Behandlungsgruppe. Gleichzeitig wird 
+klar zwischen einer ersten deskriptiven Beobachtung und einem statistisch 
+adjustierten Behandlungseffekt unterschieden.
+
+Damit wird sichtbar, dass die Analyse nicht bei einer einfachen 
+Prozentberechnung stehen bleibt, sondern die longitudinale Datenstruktur, 
+multiple Tests und mögliche Confounder in den folgenden Schritten 
+berücksichtigt.
+
+## Zeitpunktbezogene Gruppenvergleiche
+
+Die deskriptive Analyse zeigte zu allen vier Untersuchungszeitpunkten einen 
+höheren Anteil guter Atemwegszustände in der aktiven Behandlungsgruppe. 
+Nun prüfen wir für jeden Besuch separat, ob der beobachtete Unterschied 
+statistisch mit einem Unterschied zwischen den Behandlungsgruppen vereinbar 
+ist.
+
+Für jeden Untersuchungszeitpunkt testen wir:
+
+- Nullhypothese: Die Wahrscheinlichkeit eines guten Atemwegsstatus ist in 
+  beiden Behandlungsgruppen gleich.
+- Gegenhypothese: Die Wahrscheinlichkeiten unterscheiden sich.
+
+Wir verwenden dafür einen Vergleich zweier Anteile. Jeder Zeitpunkt wird 
+separat analysiert, weil dadurch sichtbar wird, zu welchen Zeitpunkten sich 
+die Gruppen unterscheiden. Da dadurch vier Hypothesen gleichzeitig geprüft 
+werden, werden die p-Werte anschließend für multiples Testen korrigiert.
+
+```{r}
+zeitpunkt_tests <- lapply(sort(unique(respiratory$visit)), function(v) {
+  
+  daten_v <- respiratory %>%
+    filter(visit == v) %>%
+    group_by(treat) %>%
+    summarise(
+      guter_status = sum(outcome == 1, na.rm = TRUE),
+      personen = n(),
+      .groups = "drop"
+    )
+  
+  test <- prop.test(
+    x = daten_v$guter_status,
+    n = daten_v$personen,
+    correct = FALSE
+  )
+  
+  tibble(
+    visit = v,
+    guter_status_aktiv = daten_v$guter_status[daten_v$treat == "A"],
+    personen_aktiv = daten_v$personen[daten_v$treat == "A"],
+    guter_status_placebo = daten_v$guter_status[daten_v$treat == "P"],
+    personen_placebo = daten_v$personen[daten_v$treat == "P"],
+    anteil_aktiv = guter_status_aktiv / personen_aktiv,
+    anteil_placebo = guter_status_placebo / personen_placebo,
+    differenz_prozentpunkte =
+      100 * (anteil_aktiv - anteil_placebo),
+    p_wert = test$p.value
+  )
+}) %>%
+  bind_rows()
+
+zeitpunkt_tests
+```
+
+### Korrektur für multiples Testen
+
+Wir korrigieren dieselben vier Roh-p-Werte mit vier Verfahren:
+
+- Bonferroni kontrolliert die maximale Wahrscheinlichkeit mindestens eines 
+  falsch positiven Ergebnisses.
+- Holm kontrolliert ebenfalls die Familywise Error Rate, ist aber meist 
+  weniger konservativ als Bonferroni.
+- Benjamini-Hochberg kontrolliert die False Discovery Rate.
+- Benjamini-Yekutieli kontrolliert die False Discovery Rate auch unter 
+  allgemeiner Abhängigkeit, ist dafür konservativer.
+
+```{r}
+p_werte <- zeitpunkt_tests$p_wert
+
+ergebnisse_multiple_tests <- zeitpunkt_tests %>%
+  transmute(
+    Besuch = paste("Besuch", visit),
+    Anteil_aktive_Behandlung = round(100 * anteil_aktiv, 1),
+    Anteil_Placebo = round(100 * anteil_placebo, 1),
+    Unterschied_Prozentpunkte = round(differenz_prozentpunkte, 1),
+    p_roh = p_wert,
+    p_bonferroni = p.adjust(p_werte, method = "bonferroni"),
+    p_holm = p.adjust(p_werte, method = "holm"),
+    p_bh = p.adjust(p_werte, method = "BH"),
+    p_by = p.adjust(p_werte, method = "BY")
+  )
+
+ergebnisse_multiple_tests
+```
+
+### Entscheidung bei einem Signifikanzniveau von 5 %
+
+```{r}
+ergebnisse_multiple_tests %>%
+  mutate(
+    signifikant_roh = p_roh < 0.05,
+    signifikant_bonferroni = p_bonferroni < 0.05,
+    signifikant_holm = p_holm < 0.05,
+    signifikant_bh = p_bh < 0.05,
+    signifikant_by = p_by < 0.05
+  )
+```
+
+### Interpretation der zeitpunktbezogenen Tests
+
+Die Roh-p-Werte beschreiben den jeweiligen Gruppenvergleich, ohne zu 
+berücksichtigen, dass vier Hypothesen gleichzeitig geprüft wurden. Eine 
+Entscheidung ausschließlich anhand der Roh-p-Werte würde daher das Risiko 
+erhöhen, mindestens einen zufällig signifikanten Unterschied zu berichten.
+
+Die adjustierten p-Werte berücksichtigen dieses Multiple-Testing-Problem. 
+Bonferroni und Holm kontrollieren die Familywise Error Rate. Sie beantworten 
+die Frage, wie wahrscheinlich es ist, in der gesamten Gruppe der vier Tests 
+mindestens einen falsch positiven Befund zu erhalten.
+
+Die Benjamini-Hochberg-Korrektur kontrolliert dagegen die erwartete 
+False Discovery Rate unter den als signifikant ausgewiesenen Ergebnissen. 
+Sie ist deshalb häufig weniger konservativ und besitzt tendenziell eine 
+höhere Teststärke. Die Benjamini-Yekutieli-Korrektur ist auch bei 
+unbekannter Abhängigkeit der Teststatistiken gültig, kann aber deutlich 
+konservativer ausfallen.
+
+Die Tests liefern zunächst zeitpunktbezogene Evidenz. Sie ersetzen noch kein 
+Modell für die wiederholten Messungen, da die Abhängigkeit der Beobachtungen 
+innerhalb derselben Person in diesen Einzelvergleichen nicht gemeinsam 
+modelliert wird. Daher folgt anschließend ein GEE-Modell als longitudinale 
+Hauptanalyse.
+
+### Interpretation der zeitpunktbezogenen Gruppenvergleiche
+
+Die aktive Behandlungsgruppe weist bei allen vier Besuchen einen höheren 
+beobachteten Anteil guter Atemwegszustände auf als die Placebogruppe.
+
+Die absoluten Unterschiede betragen:
+
+- Besuch 1: 19,4 Prozentpunkte
+- Besuch 2: 31,8 Prozentpunkte
+- Besuch 3: 26,6 Prozentpunkte
+- Besuch 4: 17,3 Prozentpunkte
+
+Der größte deskriptive Unterschied tritt somit beim zweiten Besuch auf. Beim 
+vierten Besuch ist der Unterschied weiterhin vorhanden, aber kleiner.
+
+#### Statistische Bedeutung
+
+Die unadjustierten p-Werte betragen:
+
+- Besuch 1: `p = 0,0381`
+- Besuch 2: `p = 0,000787`
+- Besuch 3: `p = 0,00445`
+- Besuch 4: `p = 0,0690`
+
+Ohne Korrektur wären die Unterschiede bei den Besuchen 1, 2 und 3 auf dem 
+5-%-Niveau statistisch auffällig. Der vierte Besuch erreicht dieses Niveau 
+nicht.
+
+Diese unadjustierten Ergebnisse dürfen jedoch nicht isoliert interpretiert 
+werden, weil vier Hypothesen gleichzeitig geprüft wurden. Je mehr 
+Hypothesen getestet werden, desto größer wird die Wahrscheinlichkeit, 
+mindestens ein zufällig signifikantes Ergebnis zu erhalten.
+
+#### Wirkung der Korrekturverfahren
+
+Die Korrekturverfahren führen zu folgenden Schlussfolgerungen:
+
+- Nach Bonferroni bleiben die Unterschiede bei Besuch 2 und Besuch 3 
+  statistisch auffällig.
+- Nach Holm bleiben ebenfalls Besuch 2 und Besuch 3 statistisch auffällig.
+- Nach Benjamini-Hochberg bleiben Besuch 1 und Besuch 2 statistisch 
+  auffällig; Besuch 3 liegt knapp oberhalb des gewählten 5-%-Niveaus.
+- Nach Benjamini-Yekutieli bleiben Besuch 2 und Besuch 3 statistisch 
+  auffällig. Dieses Verfahren ist wegen seiner Gültigkeit unter allgemeiner 
+  Abhängigkeit konservativer.
+
+Die unterschiedlichen Ergebnisse sind kein Widerspruch. Die Verfahren 
+kontrollieren unterschiedliche Fehlergrößen:
+
+- Bonferroni und Holm kontrollieren die Familywise Error Rate. Sie begrenzen 
+  die Wahrscheinlichkeit, in der gesamten Testfamilie mindestens ein falsch 
+  positives Ergebnis zu erhalten.
+- Benjamini-Hochberg kontrolliert die False Discovery Rate. Es erlaubt 
+  deshalb in der Regel mehr Entdeckungen, kontrolliert aber den erwarteten 
+  Anteil falscher Entdeckungen unter den verworfenen Nullhypothesen.
+- Benjamini-Yekutieli kontrolliert die False Discovery Rate auch unter 
+  allgemeiner Abhängigkeit der Teststatistiken, ist dafür aber meist 
+  konservativer.
+
+#### Medizinische Bedeutung
+
+Die Daten zeigen eine deskriptive und teilweise statistisch unterstützte 
+Überlegenheit der aktiven Behandlung beim Anteil guter Atemwegszustände. 
+Diese Evidenz ist besonders bei den Besuchen 2 und 3 stabil, weil die 
+Unterschiede auch nach strengeren Korrekturen weiterhin auffällig bleiben.
+
+Für Besuch 1 hängt die Schlussfolgerung stärker vom gewählten 
+Fehlerkontrollverfahren ab. Für Besuch 4 gibt es auf dem 5-%-Niveau keine 
+ausreichende statistische Evidenz für einen Gruppenunterschied.
+
+Die Ergebnisse sollten medizinisch daher nicht als Beweis verstanden werden, 
+dass die Behandlung zu jedem Zeitpunkt sicher wirksam ist. Sie sprechen 
+vielmehr dafür, dass der Behandlungseffekt zeitabhängig sein könnte und bei 
+den mittleren Besuchen besonders deutlich erscheint.
+
+#### Konsequenz für die weitere Analyse
+
+Die zeitpunktbezogenen Tests liefern nützliche Einzelvergleiche, berücksichtigen 
+aber keinen gemeinsamen longitudinalen Behandlungseffekt. Außerdem wird die 
+Abhängigkeit der vier Messungen einer Person nicht in einem gemeinsamen Modell 
+beschrieben.
+
+Deshalb verwenden wir im nächsten Schritt ein GEE-Modell. Dieses Modell 
+berücksichtigt die wiederholten binären Messungen innerhalb derselben Person 
+und ermöglicht eine gemeinsame Modellierung von Behandlung, Besuchszeitpunkt 
+und gegebenenfalls einer Behandlung-Zeit-Interaktion.
+
+Die zeitpunktbezogenen Ergebnisse bleiben als ergänzende deskriptive und 
+explorative Auswertung erhalten. Die Hauptschlussfolgerung soll jedoch auf 
+dem longitudinalen Modell und nicht auf einem einzelnen unadjustierten 
+p-Wert beruhen.
+
+#### Einordnung für Ärzte und Recruiter
+
+Die Analyse zeigt, dass ein beobachteter Behandlungsvorteil nicht einfach 
+anhand des kleinsten p-Werts beurteilt wurde. Stattdessen wurden mehrere 
+Zeitpunkte als zusammengehörige Testfamilie betrachtet und verschiedene 
+Fehlerkontrollverfahren verglichen.
+
+Damit wird transparent, dass die Schlussfolgerung davon abhängt, ob ein 
+strenger Schutz gegen mindestens einen falsch positiven Befund (FWER) oder 
+eine höhere Teststärke bei Kontrolle des erwarteten Fehlentdeckungsanteils 
+(FDR) im Vordergrund steht.
+
+## Longitudinale Analyse mit einem GEE-Modell
+
+Die bisherigen Vergleiche wurden für jeden Besuch separat durchgeführt. 
+Diese Vorgehensweise ist hilfreich für eine zeitpunktbezogene Beschreibung, 
+modelliert aber nicht den gemeinsamen Verlauf aller Messungen.
+
+Da jede Person viermal untersucht wurde, sind die Messungen innerhalb einer 
+Person wahrscheinlich abhängig. Zwei Messungen derselben Person können sich 
+ähnlicher sein als Messungen von zwei verschiedenen Personen. Diese 
+Abhängigkeit muss bei der statistischen Modellierung berücksichtigt werden.
+
+Dafür verwenden wir ein Generalized Estimating Equation-Modell (GEE). Das 
+GEE-Modell ist für longitudinale Daten mit binärem Outcome geeignet. Es 
+modelliert den erwarteten Anteil eines guten Atemwegsstatus und berücksichtigt 
+die Korrelation der wiederholten Messungen innerhalb derselben Person über 
+eine Arbeitskorrelationsstruktur.
+
+Als erste Modellierung verwenden wir ein unadjustiertes Modell. Es enthält 
+die Behandlungsgruppe, den Untersuchungszeitpunkt und deren Interaktion:
+
+- `treat`: Unterschied zwischen den Behandlungsgruppen
+- `visit`: zeitliche Veränderung des Outcomes
+- `treat * visit`: unterschiedliche zeitliche Verläufe der Gruppen
+
+Die Referenzgruppe ist die aktive Behandlungsgruppe beim ersten Besuch. 
+Der Koeffizient `treatP` beschreibt daher den Vergleich Placebo gegenüber 
+aktiver Behandlung beim ersten Besuch.
+
+```{r}
+library(geepack)
+
+respiratory <- respiratory %>%
+  mutate(
+    visit_factor = factor(visit),
+    treat = factor(treat),
+    sex = factor(sex)
+  )
+
+gee_unadjusted <- geeglm(
+  outcome ~ treat * visit_factor,
+  id = person_id,
+  data = respiratory,
+  family = binomial(link = "logit"),
+  corstr = "exchangeable"
+)
+
+summary(gee_unadjusted)
+```
+
+### Modellkoeffizienten und Odds Ratios
+
+Die Koeffizienten des logistischen GEE-Modells liegen auf der 
+Logit-Skala. Für eine medizinisch leichter interpretierbare Darstellung 
+werden sie zusätzlich exponentiert.
+
+Ein exponentierter Koeffizient ist eine Odds Ratio. Eine Odds Ratio größer 
+als 1 bedeutet höhere Odds für einen guten Atemwegsstatus, eine Odds Ratio 
+kleiner als 1 bedeutet niedrigere Odds.
+
+```{r}
+gee_koeffizienten <- summary(gee_unadjusted)$coefficients
+
+gee_ergebnisse <- tibble(
+  Term = rownames(gee_koeffizienten),
+  Koeffizient = gee_koeffizienten[, "Estimate"],
+  Standardfehler = gee_koeffizienten[, "Std.err"],
+  Wald = gee_koeffizienten[, "Wald"],
+  p_wert = gee_koeffizienten[, "Pr(>|W|)"]
+) %>%
+  mutate(
+    Odds_Ratio = exp(Koeffizient),
+    KI_unten = exp(Koeffizient - 1.96 * Standardfehler),
+    KI_oben = exp(Koeffizient + 1.96 * Standardfehler)
+  )
+
+gee_ergebnisse
+```
+
+### Prüfung der Arbeitskorrelationsstruktur
+
+Die Arbeitskorrelationsstruktur beschreibt, wie die wiederholten Messungen 
+innerhalb einer Person im Modell berücksichtigt werden. Die 
+Austauschbarkeitsstruktur (`exchangeable`) nimmt an, dass alle Messpaare 
+innerhalb einer Person dieselbe Arbeitskorrelation besitzen.
+
+Diese Struktur ist eine Modellierungsentscheidung und keine nachgewiesene 
+biologische Wahrheit. Die GEE-Schätzung des Mittelwertmodells bleibt bei 
+korrekt spezifizierter Mittelwertstruktur und robusten Standardfehlern auch 
+bei einer nicht exakt passenden Arbeitskorrelationsstruktur relativ robust.
+
+```{r}
+gee_unstructured <- geeglm(
+  outcome ~ treat * visit_factor,
+  id = person_id,
+  data = respiratory,
+  family = binomial(link = "logit"),
+  corstr = "unstructured"
+)
+
+gee_independence <- geeglm(
+  outcome ~ treat * visit_factor,
+  id = person_id,
+  data = respiratory,
+  family = binomial(link = "logit"),
+  corstr = "independence"
+)
+
+qic_vergleich <- tibble(
+  Modell = c(
+    "Unabhängig",
+    "Austauschbar",
+    "Unstrukturiert"
+  ),
+  QIC = c(
+    geepack::QIC(gee_independence)[1],
+    geepack::QIC(gee_unadjusted)[1],
+    geepack::QIC(gee_unstructured)[1]
+  )
+)
+
+qic_vergleich
+```
+
+### Inhaltliche Interpretation des GEE-Modells
+
+Das GEE-Modell beantwortet eine andere Frage als die vier separaten 
+Gruppenvergleiche. Es untersucht den durchschnittlichen Zusammenhang zwischen 
+Behandlung, Untersuchungszeitpunkt und dem binären Atemwegsstatus über die 
+wiederholten Beobachtungen hinweg.
+
+Der Behandlungseffekt darf nicht nur anhand eines einzelnen Koeffizienten 
+interpretiert werden, wenn eine Behandlung-Zeit-Interaktion im Modell 
+enthalten ist. In diesem Fall beschreibt der Haupteffekt von `treat` den 
+Gruppenunterschied beim Referenzbesuch. Die Interaktionsterme zeigen, wie 
+sich dieser Gruppenunterschied bei den späteren Besuchen verändert.
+
+Die Odds Ratio beschreibt dabei ein Verhältnis der Odds für einen guten 
+Atemwegsstatus und nicht direkt ein Verhältnis von Wahrscheinlichkeiten. 
+Eine Odds Ratio von 2 bedeutet daher nicht automatisch, dass die 
+Wahrscheinlichkeit doppelt so hoch ist.
+
+### Medizinische Bedeutung
+
+Das GEE-Modell berücksichtigt, dass wiederholte Messungen derselben Person 
+nicht unabhängig sind. Dadurch werden die Standardfehler und p-Werte 
+angemessener berechnet als bei einer Analyse, die jede Messung als 
+unabhängige Beobachtung behandelt.
+
+Für die medizinische Interpretation ist besonders relevant, ob der 
+Behandlungseffekt über die Besuche hinweg konstant bleibt oder sich im 
+Zeitverlauf verändert. Eine signifikante Interaktion würde darauf hindeuten, 
+dass sich der Unterschied zwischen aktiver Behandlung und Placebo je nach 
+Untersuchungszeitpunkt unterscheidet.
+
+### Konsequenz für die weitere Analyse
+
+Das unadjustierte GEE-Modell ist zunächst ein Basismodell. Alter und Geschlecht 
+werden anschließend in einem ergänzenden adjustierten Modell berücksichtigt. 
+Dadurch können wir prüfen, ob sich der Behandlungseffekt nach Kontrolle dieser 
+Merkmale wesentlich verändert.
+
+Eine Änderung der Odds Ratio nach Adjustierung kann darauf hindeuten, dass 
+Alter oder Geschlecht mit dem Outcome und gleichzeitig mit der 
+Behandlungszuordnung zusammenhängen. Die Aufnahme dieser Variablen wird 
+jedoch nicht allein wegen eines unausgeglichenen Geschlechterverhältnisses 
+begründet, sondern anhand ihrer fachlichen und statistischen Relevanz.
+
+Mit dem GEE-Modell wird die longitudinale Struktur der klinischen Daten 
+explizit berücksichtigt. Die Analyse unterscheidet damit zwischen einfachen 
+Einzelvergleichen und einem Modell, das alle wiederholten Beobachtungen 
+gemeinsam auswertet.
+
+Dies zeigt, dass die Behandlungseffekte nicht nur deskriptiv beschrieben, 
+sondern unter Berücksichtigung der Abhängigkeit innerhalb der Patientinnen 
+und Patienten modelliert werden.
+
+### Interpretation der GEE-Ergebnisse
+
+Das GEE-Modell berücksichtigt die vier wiederholten Messungen pro Person und 
+verwendet eine logistische Modellierung des binären Outcomes. Die 
+Koeffizienten werden als Odds Ratios interpretiert.
+
+Die Referenzsituation ist die aktive Behandlungsgruppe beim ersten Besuch. 
+Der Koeffizient `treatP` vergleicht daher die Placebogruppe mit der aktiven 
+Behandlungsgruppe beim ersten Besuch.
+
+#### Statistische Bedeutung
+
+Für den Vergleich Placebo gegenüber aktiver Behandlung beim ersten Besuch 
+ergibt sich:
+
+- Odds Ratio: `0,444`
+- 95-%-Konfidenzintervall: `0,205` bis `0,962`
+- p-Wert: `0,0396`
+
+Die Odds für einen guten Atemwegsstatus sind in der Placebogruppe beim ersten 
+Besuch geschätzt etwa 56 % niedriger als in der aktiven Behandlungsgruppe. 
+Das Konfidenzintervall liegt knapp vollständig unter 1 und der p-Wert liegt 
+knapp unter 0,05.
+
+Dieser Effekt bezieht sich jedoch ausschließlich auf den ersten Besuch, weil 
+die Behandlungs-Zeit-Interaktion im Modell enthalten ist.
+
+Die Interaktionsterme sind nicht statistisch auffällig:
+
+- Besuch 2 gegenüber Besuch 1: p = 0,208
+- Besuch 3 gegenüber Besuch 1: p = 0,457
+- Besuch 4 gegenüber Besuch 1: p = 0,773
+
+Damit gibt es in diesem Modell keinen statistisch hinreichenden Hinweis 
+darauf, dass sich der Behandlungseffekt gegenüber dem ersten Besuch 
+signifikant verändert.
+
+Auch die Haupteffekte der späteren Besuche sind nicht statistisch auffällig:
+
+- Besuch 2 gegenüber Besuch 1: p = 0,781
+- Besuch 3 gegenüber Besuch 1: p = 0,563
+- Besuch 4 gegenüber Besuch 1: p = 0,282
+
+#### Medizinische Bedeutung
+
+Die aktive Behandlung ist beim ersten Besuch mit höheren Odds für einen guten 
+Atemwegsstatus verbunden als das Placebo. Die Richtung des Effekts stimmt 
+damit mit der deskriptiven Analyse überein.
+
+Die Interaktionsterme liefern jedoch keinen ausreichenden statistischen 
+Hinweis darauf, dass sich dieser Behandlungsvorteil im weiteren Verlauf 
+systematisch verändert. Die sichtbaren Unterschiede bei den einzelnen 
+Besuchen sollten daher nicht als statistisch nachgewiesene zeitabhängige 
+Veränderung des Behandlungseffekts interpretiert werden.
+
+Wichtig ist außerdem: Eine Odds Ratio beschreibt ein Verhältnis von Odds und 
+nicht direkt ein Verhältnis von Wahrscheinlichkeiten. Eine Odds Ratio von 
+0,444 bedeutet daher nicht, dass die Wahrscheinlichkeit eines guten Status 
+im Placebo genau 44,4 % der Wahrscheinlichkeit der aktiven Behandlung 
+beträgt.
+
+#### Konsequenz für die weitere Analyse
+
+Das GEE-Modell ist gegenüber einer Analyse unabhängiger Einzelbeobachtungen 
+angemessener, weil die Abhängigkeit der wiederholten Messungen innerhalb 
+derselben Person berücksichtigt wird.
+
+Die Evidenz für den Behandlungseffekt beim ersten Besuch ist jedoch relativ 
+knapp. Das 95-%-Konfidenzintervall liegt nur knapp unter 1. Deshalb sollte 
+das Ergebnis nicht isoliert als endgültiger Wirksamkeitsnachweis betrachtet 
+werden.
+
+Als nächsten Schritt vergleichen wir das unadjustierte Modell mit einem 
+adjustierten GEE-Modell, das Alter und Geschlecht als mögliche Kovariaten 
+aufnimmt. Dadurch prüfen wir, ob sich der Behandlungseffekt nach 
+Berücksichtigung dieser Merkmale wesentlich verändert.
+
+#### Prüfung der Arbeitskorrelationsstruktur
+
+Die QIC-Werte der drei Arbeitskorrelationsstrukturen liegen gerundet alle 
+bei ungefähr 597. Auf Grundlage der gerundeten Ausgabe ist daher kein 
+deutlicher Unterschied zwischen unabhängiger, austauschbarer und 
+unstrukturierter Arbeitskorrelation erkennbar.
+
+Die Korrelationsstruktur wird nicht als biologische Tatsache interpretiert. 
+Sie beschreibt lediglich, wie die Abhängigkeit der wiederholten Messungen im 
+Arbeitsmodell approximiert wird. Die robuste GEE-Varianzschätzung reduziert 
+die Abhängigkeit der Inferenz von einer exakt richtigen 
+Korrelationsstruktur.
+
+Die longitudinale Analyse zeigt einen statistisch auffälligen Unterschied 
+zwischen Placebo und aktiver Behandlung beim ersten Besuch. Gleichzeitig 
+wird transparent ausgewiesen, dass die späteren Interaktionsterme keine 
+ausreichende Evidenz für eine Veränderung des Behandlungseffekts liefern.
+
+Damit wird zwischen einem anfänglichen Gruppenunterschied, einem möglichen 
+zeitlichen Verlauf und der Unsicherheit der Schätzung unterschieden. Die 
+Analyse berücksichtigt außerdem die wiederholten Messungen pro Person und 
+prüft die Robustheit gegenüber verschiedenen 
+Arbeitskorrelationsstrukturen.
+
+## Adjustiertes GEE-Modell
+
+Das bisherige GEE-Modell enthielt nur Behandlung, Besuchszeitpunkt und deren 
+Interaktion. Alter und Geschlecht wurden bisher noch nicht berücksichtigt.
+
+Die deskriptive Analyse zeigte, dass das Alter zwischen den 
+Behandlungsgruppen relativ ähnlich verteilt ist, während das Geschlecht 
+ungleich verteilt ist. Deshalb prüfen wir nun ergänzend, ob sich die 
+Behandlungseffekte verändern, wenn Alter und Geschlecht im Modell 
+berücksichtigt werden.
+
+Die Aufnahme dieser Variablen bedeutet nicht, dass automatisch eine 
+Verzerrung vorliegt. Sie dient dazu zu prüfen, ob die geschätzten 
+Behandlungseffekte gegenüber diesen Patientenmerkmalen robust sind.
+
+Wir verwenden erneut ein logistisches GEE-Modell mit:
+
+- Behandlung,
+- Untersuchungszeitpunkt,
+- Behandlung-Zeit-Interaktion,
+- Alter,
+- Geschlecht.
+
+Die Referenzgruppe bleibt die aktive Behandlung beim ersten Besuch. Für das 
+Geschlecht verwenden wir Männer als Referenzkategorie, da sie in der 
+Stichprobe die größere Gruppe darstellen.
+
+```{r}
+respiratory <- respiratory %>%
+  mutate(
+    treat = relevel(factor(treat), ref = "A"),
+    sex = relevel(factor(sex), ref = "M"),
+    visit_factor = factor(visit)
+  )
+
+gee_adjusted <- geeglm(
+  outcome ~ treat * visit_factor + age + sex,
+  id = person_id,
+  data = respiratory,
+  family = binomial(link = "logit"),
+  corstr = "exchangeable"
+)
+
+summary(gee_adjusted)
+```
+
+### Adjustierte Odds Ratios und Konfidenzintervalle
+
+```{r}
+gee_adjusted_coefficients <- summary(gee_adjusted)$coefficients
+
+gee_adjusted_results <- tibble(
+  Term = rownames(gee_adjusted_coefficients),
+  Koeffizient = gee_adjusted_coefficients[, "Estimate"],
+  Standardfehler = gee_adjusted_coefficients[, "Std.err"],
+  Wald = gee_adjusted_coefficients[, "Wald"],
+  p_wert = gee_adjusted_coefficients[, "Pr(>|W|)"]
+) %>%
+  mutate(
+    Odds_Ratio = exp(Koeffizient),
+    KI_unten = exp(Koeffizient - 1.96 * Standardfehler),
+    KI_oben = exp(Koeffizient + 1.96 * Standardfehler)
+  )
+
+gee_adjusted_results
+```
+
+### Vergleich des unadjustierten und adjustierten Modells
+
+Wir vergleichen insbesondere die Koeffizienten der Behandlung und der 
+Behandlung-Zeit-Interaktionen. Dadurch prüfen wir, ob sich die geschätzten 
+Behandlungseffekte nach Berücksichtigung von Alter und Geschlecht deutlich 
+verändern.
+
+```{r}
+vergleich_gee_modelle <- bind_rows(
+  gee_ergebnisse %>%
+    mutate(Modell = "Unadjustiertes GEE-Modell"),
+  gee_adjusted_results %>%
+    mutate(Modell = "Adjustiertes GEE-Modell")
+) %>%
+  select(
+    Modell,
+    Term,
+    Koeffizient,
+    Standardfehler,
+    Odds_Ratio,
+    KI_unten,
+    KI_oben,
+    p_wert
+  )
+
+vergleich_gee_modelle
+```
+
+### Interpretation des adjustierten Modells
+
+Das adjustierte Modell beantwortet die Frage, ob der Zusammenhang zwischen 
+Behandlung und Atemwegsstatus bestehen bleibt, wenn Alter und Geschlecht 
+gleichzeitig berücksichtigt werden.
+
+Wenn sich die Odds Ratio des Behandlungsterms nur wenig verändert, spricht 
+dies dafür, dass der beobachtete Behandlungseffekt gegenüber diesen 
+Kovariaten robust ist. Wenn sich die Odds Ratio deutlich verändert, deutet 
+dies darauf hin, dass Alter oder Geschlecht für die Schätzung des 
+Behandlungseffekts relevant sein könnten.
+
+Ein statistisch signifikanter Koeffizient für `age` würde bedeuten, dass sich 
+die Odds für einen guten Atemwegsstatus mit dem Alter verändern. Ein 
+signifikanter Koeffizient für `sexF` würde bedeuten, dass sich die Odds 
+zwischen Frauen und Männern unterscheiden, wobei Männer die Referenzgruppe 
+sind.
+
+Die Kovariatenkoeffizienten sind jedoch nicht automatisch kausale Effekte. 
+Sie beschreiben adjustierte Zusammenhänge innerhalb dieses Modells.
+
+### Statistische Bedeutung
+
+Der Vergleich zwischen dem unadjustierten und dem adjustierten Modell ist 
+keine zweite unabhängige Bestätigung des Behandlungseffekts. Beide Modelle 
+verwenden dieselben Personen und dieselben Messungen.
+
+Die Adjustierung dient deshalb vor allem einer Sensitivitätsanalyse: Wir 
+prüfen, ob die Schlussfolgerung gegenüber einer plausiblen Erweiterung des 
+Modells stabil bleibt.
+
+### Medizinische Bedeutung
+
+Medizinisch ist entscheidend, ob die aktive Behandlung auch nach 
+Berücksichtigung von Alter und Geschlecht mit besseren Atemwegszuständen 
+verbunden bleibt. Eine stabile Odds Ratio würde die Robustheit des 
+Behandlungssignals stärken.
+
+Eine starke Veränderung nach Adjustierung würde dagegen zeigen, dass 
+Patientenmerkmale bei der Bewertung des Behandlungseffekts berücksichtigt 
+werden müssen.
+
+### Konsequenz für die weitere Analyse
+
+Nach diesem Modellvergleich prüfen wir die Modellannahmen und die Stabilität 
+der Ergebnisse. Besonders wichtig sind:
+
+- die korrekte Spezifikation des zeitlichen Verlaufs,
+- die Behandlung-Zeit-Interaktion,
+- die gewählte Arbeitskorrelationsstruktur,
+- mögliche einflussreiche Beobachtungen,
+- die Frage, ob Alter tatsächlich linear auf der Logit-Skala wirkt.
+
+Erst danach formulieren wir die abschließende Schlussfolgerung des Projekts.
+
+
+
+Das adjustierte Modell zeigt, dass die Analyse nicht bei einem einfachen 
+Gruppenvergleich stehen bleibt. Die Behandlung wird unter Berücksichtigung 
+relevanter Patientenmerkmale und der wiederholten Messungen bewertet.
+
+Gleichzeitig wird transparent gemacht, dass Adjustierung keine automatische 
+Garantie für Kausalität ist. Sie ist eine begründete Sensitivitätsanalyse, 
+mit der geprüft wird, ob die Hauptergebnisse gegenüber möglichen 
+Störfaktoren stabil bleiben.
+
+
+### Interpretation des adjustierten GEE-Modells
+
+Das adjustierte GEE-Modell berücksichtigt zusätzlich zu Behandlung, 
+Untersuchungszeitpunkt und Behandlung-Zeit-Interaktion auch Alter und 
+Geschlecht. Die wiederholten Messungen derselben Person werden weiterhin 
+über die GEE-Clusterstruktur berücksichtigt.
+
+#### Statistische Bedeutung
+
+Der Behandlungseffekt beim ersten Besuch ergibt sich im adjustierten Modell als:
+
+- Odds Ratio für Placebo gegenüber aktiver Behandlung: `0,440`
+- 95-%-Konfidenzintervall: `0,199` bis `0,974`
+- p-Wert: `0,0428`
+
+Die Odds für einen guten Atemwegsstatus sind im Placebo beim ersten Besuch 
+geschätzt etwa 56 % niedriger als in der aktiven Behandlungsgruppe. Das 
+Konfidenzintervall liegt knapp unter 1 und der p-Wert liegt knapp unter dem 
+5-%-Niveau.
+
+Die Behandlung-Zeit-Interaktionen sind weiterhin nicht statistisch auffällig:
+
+- Besuch 2 gegenüber Besuch 1: Odds Ratio `0,593`, p = `0,206`
+- Besuch 3 gegenüber Besuch 1: Odds Ratio `0,726`, p = `0,457`
+- Besuch 4 gegenüber Besuch 1: Odds Ratio `1,12`, p = `0,781`
+
+Es gibt somit keinen ausreichenden statistischen Hinweis darauf, dass sich 
+der Behandlungseffekt im Vergleich zum ersten Besuch signifikant verändert.
+
+Der Alterseffekt beträgt:
+
+- Odds Ratio pro zusätzlichem Lebensjahr: `0,987`
+- 95-%-Konfidenzintervall: `0,963` bis `1,01`
+- p-Wert: `0,317`
+
+Das Konfidenzintervall umfasst 1. In diesem Modell gibt es daher keinen 
+ausreichenden statistischen Hinweis auf einen linearen Zusammenhang zwischen 
+Alter und den Odds für einen guten Atemwegsstatus.
+
+Für Frauen gegenüber Männern ergibt sich:
+
+- Odds Ratio: `1,10`
+- 95-%-Konfidenzintervall: `0,488` bis `2,49`
+- p-Wert: `0,814`
+
+Auch für Geschlecht zeigt sich in diesem Modell kein statistisch 
+hinreichender Zusammenhang mit dem Outcome. Wegen der kleinen Zahl von Frauen 
+und des breiten Konfidenzintervalls ist diese Schätzung jedoch relativ 
+unsicher.
+
+#### Vergleich mit dem unadjustierten Modell
+
+Der Behandlungseffekt verändert sich durch die Adjustierung nur geringfügig:
+
+- unadjustiertes Modell: Odds Ratio `0,444`, p = `0,0396`
+- adjustiertes Modell: Odds Ratio `0,440`, p = `0,0428`
+
+Auch die Behandlung-Zeit-Interaktionen bleiben nahezu unverändert. Die 
+geschätzten Behandlungseffekte sind daher gegenüber der Adjustierung für 
+Alter und Geschlecht relativ stabil.
+
+#### Medizinische Bedeutung
+
+Die aktive Behandlung ist beim ersten Besuch weiterhin mit höheren Odds für 
+einen guten Atemwegsstatus verbunden, auch nachdem Alter und Geschlecht 
+berücksichtigt wurden.
+
+Die Adjustierung verändert die Größe des Behandlungseffekts kaum. Das spricht 
+dafür, dass der beobachtete Unterschied in diesem Datensatz nicht wesentlich 
+durch die unterschiedliche Altersverteilung oder Geschlechtsverteilung 
+erklärt wird.
+
+Gleichzeitig ist die statistische Evidenz knapp. Das Konfidenzintervall liegt 
+nur knapp unter 1. Deshalb sollte der Befund als Hinweis auf einen 
+Behandlungsunterschied und nicht als endgültiger Wirksamkeitsnachweis 
+interpretiert werden.
+
+Für Alter und Geschlecht wurde kein statistisch hinreichender Zusammenhang 
+mit dem Atemwegsstatus festgestellt. Das bedeutet nicht, dass ein solcher 
+Zusammenhang in der Grundgesamtheit unmöglich ist. Die Konfidenzintervalle 
+zeigen vielmehr, dass die vorliegenden Daten insbesondere für Geschlecht 
+keine sehr präzise Schätzung erlauben.
+
+#### Konsequenz für die weitere Analyse
+
+Die Stabilität zwischen unadjustiertem und adjustiertem Modell stärkt die 
+Robustheit der bisherigen Behandlungsschätzung. Dennoch bleiben mehrere 
+Einschränkungen bestehen:
+
+- Die Zahl der Personen ist mit 111 relativ klein.
+- Die Zahl der Frauen ist unausgeglichen und gering.
+- Die Analyse prüft einen linearen Alterseffekt auf der Logit-Skala.
+- Die Behandlung-Zeit-Interaktionen sind nicht statistisch auffällig, 
+  sodass kein klarer zeitabhängiger Behandlungseffekt nachgewiesen wurde.
+- Das Ergebnis beim ersten Besuch liegt nahe an der Signifikanzgrenze.
+
+Die Adjustierung korrigiert außerdem nicht automatisch mögliche 
+Verzerrungen durch unbeobachtete Confounder. Sie zeigt nur, wie stabil die 
+Schätzung gegenüber den konkret aufgenommenen Kovariaten Alter und Geschlecht 
+ist.
+
+#### Einordnung für Ärztinnen und Ärzte
+
+Nach Berücksichtigung der wiederholten Messungen, des Alters und des 
+Geschlechts bleibt ein Vorteil der aktiven Behandlung beim ersten Besuch 
+sichtbar. Die Stärke des geschätzten Effekts verändert sich durch die 
+Adjustierung kaum.
+
+Es gibt jedoch keinen statistisch ausreichenden Hinweis darauf, dass sich 
+dieser Behandlungsvorteil über die weiteren Besuche systematisch verändert. 
+Die Ergebnisse sollten daher als longitudinaler, adjustierter Hinweis 
+interpretiert werden und nicht als Beweis einer zu jedem Zeitpunkt 
+gleichbleibenden Behandlungseffektivität.
+
+Die Analyse zeigt, dass der Behandlungseffekt in einem unadjustierten und 
+einem adjustierten longitudinalen Modell verglichen wurde. Die Stabilität 
+der Odds Ratio wurde ausdrücklich geprüft, statt nur einen einzelnen 
+p-Wert zu berichten.
+
+Zusätzlich wurden die Grenzen der Daten berücksichtigt: ungleiche 
+Geschlechtsverteilung, breite Konfidenzintervalle und die Unsicherheit bei 
+einer kleinen Stichprobe. Dadurch wird deutlich, dass die Modellierung, 
+Interpretation und Bewertung der Evidenz gemeinsam betrachtet wurden.
+
+## Modellbasierte Wahrscheinlichkeiten
+
+Die Odds Ratios des logistischen GEE-Modells sind mathematisch korrekt, aber 
+medizinisch nicht immer intuitiv. Deshalb berechnen wir zusätzlich die 
+modellbasierten Wahrscheinlichkeiten eines guten Atemwegsstatus.
+
+Wir verwenden dafür:
+
+- das durchschnittliche Alter der Stichprobe,
+- die Referenzkategorie Männer,
+- jeweils eine Kombination aus Behandlung und Besuch.
+
+Die Vorhersagen dienen der verständlichen Darstellung des Modells. Sie sind 
+keine neuen Rohdaten und ersetzen nicht die Konfidenzintervalle oder die 
+Modellprüfung.
+
+```{r}
+vorhersage_daten <- expand.grid(
+  treat = levels(respiratory$treat),
+  visit_factor = levels(respiratory$visit_factor),
+  age = mean(respiratory$age, na.rm = TRUE),
+  sex = factor("M", levels = levels(respiratory$sex))
+) %>%
+  mutate(
+    visit = as.integer(as.character(visit_factor)),
+    Behandlung = case_when(
+      treat == "A" ~ "Aktive Behandlung",
+      treat == "P" ~ "Placebo",
+      TRUE ~ as.character(treat)
+    ),
+    Besuch = paste("Besuch", visit)
+  )
+
+vorhersage_daten$geschaetzte_wahrscheinlichkeit <-
+  predict(
+    gee_adjusted,
+    newdata = vorhersage_daten,
+    type = "response"
+  )
+
+vorhersage_daten %>%
+  select(
+    Behandlung,
+    Besuch,
+    age,
+    sex,
+    geschaetzte_wahrscheinlichkeit
+  ) %>%
+  mutate(
+    geschaetzte_wahrscheinlichkeit_prozent =
+      round(100 * geschaetzte_wahrscheinlichkeit, 1)
+  )
+```
+
+### Grafische Darstellung der modellbasierten Wahrscheinlichkeiten
+
+```{r}
+ggplot(
+  vorhersage_daten,
+  aes(
+    x = visit,
+    y = geschaetzte_wahrscheinlichkeit,
+    color = treat,
+    group = treat
+  )
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(
+    breaks = 1:4,
+    labels = paste("Besuch", 1:4)
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  scale_color_manual(
+    values = c(
+      A = "#1B6CA8",
+      P = "#D97904"
+    ),
+    labels = c(
+      A = "Aktive Behandlung",
+      P = "Placebo"
+    )
+  ) +
+  labs(
+    x = "Untersuchungszeitpunkt",
+    y = "Modellbasierte Wahrscheinlichkeit eines guten Status",
+    color = "Behandlungsgruppe",
+    title = "Modellbasierte Wahrscheinlichkeiten nach Behandlung und Besuch"
+  ) +
+  theme_minimal()
+```
+
+### Interpretation der modellbasierten Wahrscheinlichkeiten
+
+Die modellbasierten Wahrscheinlichkeiten zeigen, wie das adjustierte GEE-Modell 
+den erwarteten Anteil eines guten Atemwegsstatus für typische 
+Patientenmerkmale schätzt.
+
+Im Unterschied zu den Rohanteilen werden hier Behandlung, Besuchszeitpunkt, 
+Alter und Geschlecht gemeinsam im Modell berücksichtigt. Die Darstellung 
+erleichtert deshalb die medizinische Interpretation der Odds-Ratios.
+
+Die Wahrscheinlichkeiten dürfen nicht als individuelle Prognosen für eine 
+bestimmte Patientin oder einen bestimmten Patienten verstanden werden. Sie 
+beschreiben den vom Modell erwarteten Gruppenmittelwert für eine Person mit 
+dem verwendeten Referenzprofil.
+
+## Prüfung der Modellstruktur
+
+Vor einer abschließenden Interpretation prüfen wir, ob die gewählte 
+Modellstruktur plausibel ist. Insbesondere betrachten wir:
+
+- die Behandlung-Zeit-Interaktion,
+- die lineare Modellierung des Alters,
+- die Verteilung der modellbasierten Vorhersagen,
+- mögliche besonders einflussreiche Beobachtungen.
+
+Die bisherige GEE-Analyse liefert keinen statistisch ausreichenden Hinweis 
+auf eine Behandlung-Zeit-Interaktion. Deshalb ist ein zeitlich konstanter 
+Behandlungseffekt als vereinfachtes Vergleichsmodell grundsätzlich 
+plausibel. Die Interaktion bleibt jedoch als Sensitivitätsanalyse im Modell, 
+weil der beobachtete Verlauf zwischen den Besuchen nicht völlig konstant ist.
+
+```{r}
+gee_ohne_interaktion <- geeglm(
+  outcome ~ treat + visit_factor + age + sex,
+  id = person_id,
+  data = respiratory,
+  family = binomial(link = "logit"),
+  corstr = "exchangeable"
+)
+
+modellvergleich_zeit <- tibble(
+  Modell = c(
+    "Mit Behandlung-Zeit-Interaktion",
+    "Ohne Behandlung-Zeit-Interaktion"
+  ),
+  QIC = c(
+    geepack::QIC(gee_adjusted)[1],
+    geepack::QIC(gee_ohne_interaktion)[1]
+  )
+)
+
+modellvergleich_zeit
+```
+
+### Bedeutung der Modellprüfung
+
+Ein Modellvergleich anhand des QIC dient der Orientierung bei der Auswahl 
+der Mittelwertstruktur. Ein kleinerer QIC-Wert spricht innerhalb dieser 
+Modellklasse für eine bessere Balance zwischen Modellanpassung und 
+Komplexität.
+
+Der QIC ist jedoch kein Beweis dafür, dass ein Modell „wahr“ ist. Die 
+Entscheidung muss zusätzlich fachlich begründet werden. Eine nicht 
+signifikante Interaktion und ein ähnlicher oder kleinerer QIC-Wert des 
+vereinfachten Modells würden dafür sprechen, den Behandlungseffekt ohne 
+Behandlung-Zeit-Interaktion zusammenfassend zu berichten.
+
+### Interpretation der modellbasierten Wahrscheinlichkeiten
+
+Für eine typische Person mit dem mittleren Alter der Stichprobe von 33,3 Jahren 
+und der Referenzkategorie Männer schätzt das adjustierte GEE-Modell folgende 
+Wahrscheinlichkeiten für einen guten Atemwegsstatus:
+
+| Besuch | Aktive Behandlung | Placebo | Deskriptiver Unterschied |
+|---|---:|---:|---:|
+| Besuch 1 | 68,2 % | 48,6 % | 19,6 Prozentpunkte |
+| Besuch 2 | 70,1 % | 38,0 % | 32,1 Prozentpunkte |
+| Besuch 3 | 72,0 % | 45,1 % | 26,9 Prozentpunkte |
+| Besuch 4 | 60,8 % | 43,3 % | 17,5 Prozentpunkte |
+
+#### Statistische Bedeutung
+
+Die modellbasierten Wahrscheinlichkeiten bestätigen die Richtung der 
+deskriptiven Analyse: Die aktive Behandlungsgruppe weist bei allen vier 
+Besuchen eine höhere geschätzte Wahrscheinlichkeit für einen guten 
+Atemwegsstatus auf.
+
+Die modellbasierten Werte unterscheiden sich geringfügig von den Rohanteilen, 
+weil das GEE-Modell Behandlung, Besuchszeitpunkt, Alter und Geschlecht 
+gleichzeitig berücksichtigt.
+
+Die größte modellbasierte Differenz zeigt sich beim zweiten Besuch. Dort 
+beträgt der Unterschied ungefähr 32,1 Prozentpunkte. Beim vierten Besuch ist 
+der Unterschied mit ungefähr 17,5 Prozentpunkten kleiner.
+
+Diese Wahrscheinlichkeiten sind jedoch modellbasierte Gruppenmittelwerte. Sie 
+sind keine individuellen Vorhersagen für einzelne Patientinnen oder Patienten.
+
+#### Medizinische Bedeutung
+
+Für eine typische männliche Person im mittleren Alter der Stichprobe würde das 
+Modell unter der aktiven Behandlung bei jedem Besuch eine höhere 
+Wahrscheinlichkeit für einen guten Atemwegsstatus erwarten.
+
+Der größte geschätzte Behandlungsvorteil tritt beim zweiten Besuch auf. Beim 
+vierten Besuch bleibt der Vorteil der aktiven Behandlung bestehen, fällt aber 
+geringer aus.
+
+Medizinisch deutet dies auf einen günstigeren beobachteten Status unter der 
+aktiven Behandlung hin. Wegen der statistischen Unsicherheit und der fehlenden 
+Signifikanz der Behandlung-Zeit-Interaktionen kann jedoch kein sicherer 
+zeitabhängiger Wirksamkeitsverlauf behauptet werden.
+
+#### Konsequenz für die weitere Analyse
+
+Die Vorhersagen machen die Ergebnisse verständlicher, ersetzen aber nicht die 
+Konfidenzintervalle und die Modellprüfung. Die endgültige Bewertung muss 
+weiterhin auf den Odds Ratios, Konfidenzintervallen, p-Werten und der 
+Plausibilität der Modellannahmen beruhen.
+
+Als Nächstes vergleichen wir ein Modell mit Behandlung-Zeit-Interaktion mit 
+einem einfacheren Modell ohne diese Interaktion.
+
+### Vergleich mit und ohne Behandlung-Zeit-Interaktion
+
+Das Modell mit Interaktion hat einen QIC-Wert von ungefähr 604. Das Modell 
+ohne Interaktion hat einen QIC-Wert von ungefähr 602.
+
+Der kleinere QIC-Wert des Modells ohne Interaktion spricht innerhalb dieser 
+Modellklasse für eine etwas bessere Balance zwischen Anpassung und 
+Modellkomplexität. Zusammen mit den nicht signifikanten 
+Behandlung-Zeit-Interaktionen gibt es keinen starken statistischen Grund, die 
+komplexere Interaktion im endgültigen Modell beizubehalten.
+
+Wir verwenden daher für die zusammenfassende Behandlungsschätzung ein 
+vereinfachtes GEE-Modell ohne Behandlung-Zeit-Interaktion. Die 
+zeitpunktbezogenen Ergebnisse und das Interaktionsmodell bleiben als 
+ergänzende Sensitivitätsanalyse dokumentiert.
+
+Der QIC ist kein Beweis dafür, dass ein Modell „wahr“ ist. Er ist ein 
+vergleichendes Kriterium innerhalb der betrachteten GEE-Modelle und muss 
+zusammen mit der fachlichen Fragestellung und den Modellannahmen interpretiert 
+werden.
+
+#### Einordnung für Ärztinnen und Ärzte
+
+Das adjustierte Modell schätzt für typische Personen einen höheren Anteil 
+guter Atemwegszustände unter der aktiven Behandlung. 
+Dieser Vorteil ist bei allen vier Besuchen sichtbar und beim zweiten Besuch am stärksten.
+
+Der Modellvergleich liefert jedoch keinen überzeugenden Hinweis darauf, dass der Behandlungseffekt zwischen den Besuchen statistisch unterschiedlich ist. Daher wird der Behandlungseffekt im vereinfachten Modell als durchschnittlicher Effekt über den Beobachtungszeitraum zusammengefasst.
+
+Die Analyse übersetzt logistische Modellkoeffizienten in verständliche 
+Wahrscheinlichkeiten und vergleicht zusätzlich eine komplexe mit einer 
+vereinfachten Modellstruktur. Die Entscheidung für das einfachere Modell 
+basiert nicht nur auf einem p-Wert, sondern auf der Kombination aus 
+Interaktionstest, QIC und fachlicher Interpretierbarkeit.
+
+## Vereinfachtes finales GEE-Modell
+
+Das Modell mit der Behandlung-Zeit-Interaktion zeigte keinen ausreichenden 
+statistischen Hinweis darauf, dass sich der Behandlungseffekt zwischen den 
+Besuchen verändert. Außerdem war der QIC-Wert des einfacheren Modells 
+geringer.
+
+Daher schätzen wir zusätzlich ein parsimonisches Modell ohne 
+Behandlung-Zeit-Interaktion. Dieses Modell beschreibt:
+
+- den durchschnittlichen Unterschied zwischen den Behandlungsgruppen,
+- die durchschnittliche Veränderung über die Untersuchungszeitpunkte,
+- den Zusammenhang von Alter und Geschlecht mit dem Outcome,
+- unter Berücksichtigung der wiederholten Messungen innerhalb derselben 
+  Person.
+
+```{r}
+gee_final <- geeglm(
+  outcome ~ treat + visit_factor + age + sex,
+  id = person_id,
+  data = respiratory,
+  family = binomial(link = "logit"),
+  corstr = "exchangeable"
+)
+
+summary(gee_final)
+```
+
+### Ergebnisse des finalen Modells
+
+```{r}
+gee_final_coefficients <- summary(gee_final)$coefficients
+
+gee_final_results <- tibble(
+  Term = rownames(gee_final_coefficients),
+  Koeffizient = gee_final_coefficients[, "Estimate"],
+  Standardfehler = gee_final_coefficients[, "Std.err"],
+  Wald = gee_final_coefficients[, "Wald"],
+  p_wert = gee_final_coefficients[, "Pr(>|W|)"]
+) %>%
+  mutate(
+    Odds_Ratio = exp(Koeffizient),
+    KI_unten = exp(Koeffizient - 1.96 * Standardfehler),
+    KI_oben = exp(Koeffizient + 1.96 * Standardfehler)
+  )
+
+gee_final_results
+```
+
+### Direkter Vergleich des Behandlungseffekts
+
+```{r}
+behandlung_final <- gee_final_results %>%
+  filter(Term == "treatP") %>%
+  mutate(
+    Vergleich = "Placebo gegenüber aktiver Behandlung"
+  ) %>%
+  select(
+    Vergleich,
+    Odds_Ratio,
+    KI_unten,
+    KI_oben,
+    p_wert
+  )
+
+behandlung_final
+```
+
+### Modellbasierte Wahrscheinlichkeiten aus dem finalen Modell
+
+```{r}
+vorhersage_final <- expand.grid(
+  treat = levels(respiratory$treat),
+  visit_factor = levels(respiratory$visit_factor),
+  age = mean(respiratory$age, na.rm = TRUE),
+  sex = factor("M", levels = levels(respiratory$sex))
+) %>%
+  mutate(
+    visit = as.integer(as.character(visit_factor)),
+    Behandlung = case_when(
+      treat == "A" ~ "Aktive Behandlung",
+      treat == "P" ~ "Placebo",
+      TRUE ~ as.character(treat)
+    ),
+    Besuch = paste("Besuch", visit)
+  )
+
+vorhersage_final$wahrscheinlichkeit_guter_status <-
+  predict(
+    gee_final,
+    newdata = vorhersage_final,
+    type = "response"
+  )
+
+vorhersage_final %>%
+  select(
+    Behandlung,
+    Besuch,
+    age,
+    sex,
+    wahrscheinlichkeit_guter_status
+  ) %>%
+  mutate(
+    wahrscheinlichkeit_prozent =
+      round(100 * wahrscheinlichkeit_guter_status, 1)
+  )
+```
+
+### Interpretation des finalen Modells
+
+Das finale Modell liefert eine zusammenfassende Schätzung des 
+durchschnittlichen Behandlungseffekts über den Beobachtungszeitraum. Weil 
+keine Behandlung-Zeit-Interaktion enthalten ist, wird angenommen, dass der 
+Behandlungseffekt auf der Modellskala über die Besuche hinweg konstant ist.
+
+Die Odds Ratio für `treatP` vergleicht die Placebogruppe mit der aktiven 
+Behandlungsgruppe. Eine Odds Ratio kleiner als 1 bedeutet, dass die Placebo-
+gruppe niedrigere Odds für einen guten Atemwegsstatus aufweist. Umgekehrt 
+spricht eine Odds Ratio größer als 1 für höhere Odds in der Placebogruppe.
+
+Die Besuchskoeffizienten beschreiben Veränderungen gegenüber dem ersten 
+Besuch. Die Koeffizienten für Alter und Geschlecht beschreiben adjustierte 
+Zusammenhänge und sind nicht automatisch kausale Effekte.
+
+### Statistische Bedeutung
+
+Das finale Modell ist einfacher als das Interaktionsmodell und vermeidet 
+unnötige Parameter. Dadurch wird die Schätzung übersichtlicher und kann bei 
+kleiner Stichprobe stabiler sein.
+
+Die Vereinfachung ist jedoch nur dann angemessen, wenn die Annahme eines 
+annähernd konstanten Behandlungseffekts fachlich plausibel ist. Die 
+Interaktionsanalyse und der QIC-Vergleich liefern hierfür unterstützende, 
+aber keinen endgültigen Beweis.
+
+### Medizinische Bedeutung
+
+Der Behandlungseffekt wird im finalen Modell als durchschnittlicher 
+Unterschied zwischen aktiver Behandlung und Placebo über die vier Besuche 
+interpretiert. Das Modell beantwortet damit die Frage, ob die aktive 
+Behandlung im gesamten Beobachtungszeitraum im Mittel mit einem besseren 
+Atemwegsstatus verbunden ist.
+
+Die modellbasierten Wahrscheinlichkeiten erleichtern die klinische 
+Interpretation, weil sie direkt den erwarteten Anteil guter 
+Atemwegszustände für typische Patientenprofile darstellen.
+
+### Konsequenz für die weitere Analyse
+
+Vor der endgültigen Schlussfolgerung prüfen wir noch:
+
+- ob das Alter auf der Logit-Skala angemessen linear modelliert ist,
+- ob einzelne Beobachtungen das Modell stark beeinflussen,
+- ob die Ergebnisse bei einer anderen Arbeitskorrelationsstruktur ähnlich 
+  bleiben,
+- ob die Unterschiede zwischen den Rohanteilen und Modellschätzungen 
+  plausibel sind.
+
+Danach können wir eine abschließende Zusammenfassung des Projekts 
+formulieren.
+
+### Einordnung für Ärztinnen und Ärzte
+
+Das finale GEE-Modell schätzt den durchschnittlichen Behandlungseffekt über 
+den gesamten Beobachtungszeitraum und berücksichtigt dabei die Abhängigkeit 
+der wiederholten Messungen innerhalb einer Person.
+
+Die aktive Behandlung wird nicht nur über einzelne Prozentwerte bewertet, 
+sondern in einem longitudinalen Modell gemeinsam mit Besuchszeitpunkt, 
+Alter und Geschlecht betrachtet.
+
+
+
+Die Modellwahl folgt einer nachvollziehbaren statistischen Logik: Zuerst 
+wurde ein flexibleres Interaktionsmodell geschätzt, anschließend wurden 
+Interaktion, QIC und fachliche Interpretierbarkeit berücksichtigt. Erst 
+danach wurde das parsimonische Modell als finales Modell ausgewählt.
+### Interpretation des finalen GEE-Modells
+
+Das finale Modell berücksichtigt die wiederholten Messungen innerhalb jeder 
+Person und schätzt einen durchschnittlichen Behandlungseffekt über den 
+gesamten Beobachtungszeitraum. Es enthält Behandlung, Besuchszeitpunkt, 
+Alter und Geschlecht, jedoch keine Behandlung-Zeit-Interaktion.
+
+#### Statistische Bedeutung
+
+Der zentrale Behandlungseffekt lautet:
+
+- Odds Ratio für Placebo gegenüber aktiver Behandlung: `0,368`
+- 95-%-Konfidenzintervall: `0,196` bis `0,691`
+- p-Wert: `0,00186`
+
+Die Odds für einen guten Atemwegsstatus sind im Placebo im Mittel etwa 
+63,2 % niedriger als unter der aktiven Behandlung:
+
+\[
+1 - 0{,}368 = 0{,}632.
+\]
+
+Das 95-%-Konfidenzintervall liegt vollständig unter 1. Im finalen GEE-Modell 
+besteht daher ein statistisch deutlicher Zusammenhang zwischen aktiver 
+Behandlung und höheren Odds für einen guten Atemwegsstatus.
+
+Die Besuchseffekte werden jeweils mit Besuch 1 verglichen:
+
+- Besuch 2: Odds Ratio `0,822`, p = `0,334`
+- Besuch 3: Odds Ratio `1,000`, p = `1,000`
+- Besuch 4: Odds Ratio `0,761`, p = `0,176`
+
+Für keinen Besuch gibt es einen statistisch ausreichenden Hinweis auf eine 
+Veränderung gegenüber Besuch 1.
+
+Der Alterseffekt beträgt:
+
+- Odds Ratio pro zusätzlichem Lebensjahr: `0,987`
+- 95-%-Konfidenzintervall: `0,963` bis `1,01`
+- p-Wert: `0,314`
+
+Für Alter zeigt sich in diesem Modell kein statistisch ausreichender Hinweis 
+auf einen linearen Zusammenhang mit den Odds eines guten Atemwegsstatus.
+
+Für Frauen gegenüber Männern ergibt sich:
+
+- Odds Ratio: `1,11`
+- 95-%-Konfidenzintervall: `0,492` bis `2,49`
+- p-Wert: `0,806`
+
+Auch für Geschlecht zeigt sich kein statistisch ausreichender Zusammenhang. 
+Das breite Konfidenzintervall weist jedoch auf eine relativ unpräzise 
+Schätzung hin.
+
+#### Medizinische Bedeutung
+
+Die aktive Behandlung ist im Mittel über den gesamten Beobachtungszeitraum 
+mit deutlich höheren Odds für einen guten Atemwegsstatus verbunden als das 
+Placebo.
+
+Die modellbasierten Wahrscheinlichkeiten für eine typische männliche Person 
+im mittleren Alter der Stichprobe betragen:
+
+| Besuch | Aktive Behandlung | Placebo |
+|---|---:|---:|
+| Besuch 1 | 70,3 % | 46,6 % |
+| Besuch 2 | 66,1 % | 41,7 % |
+| Besuch 3 | 70,3 % | 46,6 % |
+| Besuch 4 | 64,3 % | 39,9 % |
+
+Die aktive Behandlung zeigt somit bei allen vier Besuchen eine höhere 
+modellbasierte Wahrscheinlichkeit für einen guten Atemwegsstatus. Die 
+absoluten Unterschiede liegen modellbasiert ungefähr zwischen 24 und 
+26 Prozentpunkten.
+
+Diese Wahrscheinlichkeiten sind erwartete Gruppenmittelwerte für ein 
+bestimmtes Referenzprofil. Sie sind keine individuellen Prognosen für 
+einzelne Patientinnen oder Patienten.
+
+#### Vergleich mit dem Interaktionsmodell
+
+Im vorherigen Modell mit Behandlung-Zeit-Interaktion waren die 
+Interaktionsterme nicht statistisch auffällig. Außerdem hatte das Modell 
+ohne Interaktion den niedrigeren QIC-Wert.
+
+Das finale Modell fasst deshalb den Behandlungseffekt als durchschnittlichen 
+Effekt über die vier Besuche zusammen. Diese Vereinfachung ist 
+parsimonischer und vermeidet unnötige zusätzliche Parameter.
+
+Die Modellwahl ist jedoch keine Aussage, dass der Behandlungseffekt in jeder 
+Situation exakt konstant sein muss. Sie bedeutet, dass die vorliegenden Daten 
+keinen ausreichenden Beleg für eine systematische Veränderung des Effekts 
+über die Zeit liefern.
+
+#### Konsequenz für die weitere Analyse
+
+Das finale Modell liefert die wichtigste zusammenfassende Schätzung dieses 
+Projekts. Die aktive Behandlung ist nach Berücksichtigung der wiederholten 
+Messungen, des Alters und des Geschlechts mit höheren Odds für einen guten 
+Atemwegsstatus verbunden.
+
+Die Aussage bleibt auf einen statistischen Zusammenhang innerhalb dieses 
+Datensatzes beschränkt. Sie ist kein uneingeschränkter kausaler Nachweis für 
+alle Patientengruppen, weil unter anderem die Stichprobe klein ist und die 
+Geschlechtsverteilung unausgewogen bleibt.
+
+Vor der abschließenden Zusammenfassung sollten noch die Grenzen des Modells 
+und die Annahmen dokumentiert werden. Dazu gehören insbesondere:
+
+- Unabhängigkeit verschiedener Personen,
+- korrekte Zuordnung der wiederholten Messungen zu den Personen,
+- angemessene logistische Modellierung des binären Outcomes,
+- plausible Arbeitskorrelationsstruktur,
+- linearer Alterseffekt auf der Logit-Skala,
+- keine starken einflussreichen Einzelbeobachtungen.
+
+#### Einordnung für Ärztinnen und Ärzte
+
+Nach Berücksichtigung der longitudinalen Datenstruktur sowie von Alter und 
+Geschlecht zeigt sich ein klarer statistischer Zusammenhang zwischen der 
+aktiven Behandlung und einem besseren Atemwegsstatus.
+
+Die modellbasierten Wahrscheinlichkeiten liegen bei der aktiven Behandlung 
+an allen vier Besuchen über denen des Placebos. Ein statistisch nachgewiesener 
+zeitlicher Verlauf des Behandlungseffekts wurde jedoch nicht festgestellt.
+
+#### Fazit
+
+Die finale Analyse folgt einer nachvollziehbaren Modellstrategie: Zuerst 
+wurden deskriptive Unterschiede untersucht, anschließend zeitpunktbezogene 
+Tests mit Korrektur für multiples Testen durchgeführt. Danach wurde ein 
+GEE-Modell zur Berücksichtigung wiederholter Messungen geschätzt, adjustiert 
+und mithilfe von Interaktion und QIC vereinfacht.
+
+Das finale Ergebnis basiert damit nicht auf einem einzelnen p-Wert, sondern 
+auf einer begründeten Folge von Datenprüfung, Modellierung, Sensitivitätsanalyse 
+und verständlicher Ergebnisinterpretation.
+
+## Diagnostik und Sensitivitätsanalyse
+
+Auch ein statistisch signifikantes Ergebnis ist nur dann sinnvoll 
+interpretierbar, wenn die gewählte Modellstruktur plausibel ist. Deshalb 
+prüfen wir nun zentrale Modellannahmen und die Stabilität der Ergebnisse.
+
+Das finale GEE-Modell enthält Alter als lineare Kovariate. Das bedeutet, dass 
+sich der Zusammenhang zwischen Alter und dem Logit der Wahrscheinlichkeit 
+eines guten Atemwegsstatus mit jedem zusätzlichen Lebensjahr in gleicher 
+Weise verändert.
+
+Diese Annahme wird durch die Daten nicht automatisch garantiert. Deshalb 
+vergleichen wir das lineare Altersmodell mit einem Modell, das einen 
+flexibleren, nichtlinearen Alterseffekt erlaubt.
+
+```{r}
+library(splines)
+
+gee_age_nonlinear <- geeglm(
+  outcome ~ treat + visit_factor + ns(age, df = 2) + sex,
+  id = person_id,
+  data = respiratory,
+  family = binomial(link = "logit"),
+  corstr = "exchangeable"
+)
+
+modellvergleich_alter <- tibble(
+  Modell = c(
+    "Lineares Altersmodell",
+    "Nichtlineares Altersmodell"
+  ),
+  QIC = c(
+    geepack::QIC(gee_final)[1],
+    geepack::QIC(gee_age_nonlinear)[1]
+  )
+)
+
+modellvergleich_alter
+```
+
+### Prüfung der Pearson-Residuals
+
+Pearson-Residuals vergleichen die beobachteten Outcome-Werte mit den vom 
+Modell erwarteten Werten unter Berücksichtigung der geschätzten Varianz.
+
+Bei einem gut passenden Modell sollten keine deutlich systematischen Muster 
+sichtbar sein. Einzelne größere Residuen sind nicht automatisch Fehler. Sie 
+können auf ungewöhnliche Beobachtungen oder auf eine nicht vollständig 
+erfasste Heterogenität hinweisen.
+
+```{r}
+diagnostik_gee <- respiratory %>%
+  mutate(
+    vorhergesagt = fitted(gee_final),
+    pearson_residuum = residuals(gee_final, type = "pearson")
+  )
+
+summary(diagnostik_gee$pearson_residuum)
+```
+
+```{r}
+ggplot(
+  diagnostik_gee,
+  aes(
+    x = vorhergesagt,
+    y = pearson_residuum
+  )
+) +
+  geom_point(
+    alpha = 0.55,
+    color = "#1B6CA8"
+  ) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    color = "#D97904"
+  ) +
+  labs(
+    x = "Vom Modell geschätzte Wahrscheinlichkeit",
+    y = "Pearson-Residuum",
+    title = "Pearson-Residuals des finalen GEE-Modells"
+  ) +
+  theme_minimal()
+```
+
+### Prüfung besonders großer Residuen
+
+```{r}
+diagnostik_gee %>%
+  mutate(
+    abs_pearson_residuum = abs(pearson_residuum)
+  ) %>%
+  arrange(desc(abs_pearson_residuum)) %>%
+  select(
+    person_id,
+    visit,
+    treat,
+    age,
+    sex,
+    outcome,
+    vorhergesagt,
+    pearson_residuum
+  ) %>%
+  slice_head(n = 10)
+```
+
+### Interpretation der Modellprüfung
+
+Ein kleinerer QIC-Wert des nichtlinearen Altersmodells würde darauf 
+hindeuten, dass die lineare Altersannahme möglicherweise zu stark 
+vereinfachend ist. Ein ähnlicher oder größerer QIC-Wert würde dagegen dafür 
+sprechen, dass das lineare Altersmodell für diese Daten ausreichend ist.
+
+Der QIC entscheidet jedoch nicht allein über die Modellwahl. Auch die 
+Interpretierbarkeit, die Stichprobengröße und die fachliche Plausibilität 
+müssen berücksichtigt werden.
+
+Die Pearson-Residuals dienen der diagnostischen Prüfung der Modellanpassung. 
+Einzelne größere Residuen sind bei einem binären Outcome erwartbar und 
+bedeuten nicht automatisch, dass Daten fehlerhaft sind. Entscheidend wäre 
+ein systematisches Muster, beispielsweise eine deutliche Veränderung der 
+Residuen über die vorhergesagten Wahrscheinlichkeiten.
+
+Die Diagnostik beweist nicht, dass das GEE-Modell vollständig korrekt ist. 
+Sie kann lediglich Hinweise auf offensichtliche Fehlanpassungen oder 
+problematische Beobachtungen liefern.
+
+### Konsequenz für die weitere Analyse
+
+Wenn sich die Behandlungsschätzung zwischen dem linearen und dem 
+nichtlinearen Altersmodell nur geringfügig verändert, spricht dies für eine 
+robuste Schlussfolgerung gegenüber der Modellierung des Alters.
+
+Wenn einzelne Beobachtungen große Residuen aufweisen, werden sie nicht 
+automatisch entfernt. Zunächst wird geprüft, ob es sich um plausible 
+klinische Beobachtungen, Eingabefehler oder ungewöhnliche Patientinnen und 
+Patienten handelt.
+
+Eine Beobachtung darf nur aus einem nachvollziehbaren sachlichen Grund 
+entfernt werden, nicht lediglich, weil sie das gewünschte Ergebnis 
+verschlechtert.
+
+### Einordnung für Ärztinnen und Ärzte
+
+Die Modellprüfung untersucht, ob die angenommene Form des Alterseffekts 
+plausibel ist und ob einzelne Beobachtungen die Schätzung stark beeinflussen. 
+Dadurch wird verhindert, dass der Behandlungseffekt ausschließlich aus einem 
+zu stark vereinfachten Modell abgeleitet wird.
+
+### Zusammenfassung
+
+Die Analyse umfasst nicht nur Modellschätzung und p-Werte, sondern auch 
+Sensitivitätsanalysen und Residualdiagnostik. Die Entscheidung, Beobachtungen 
+nicht automatisch als Ausreißer zu entfernen, zeigt einen sachgerechten und 
+reproduzierbaren Umgang mit klinischen Daten.
+
+### Ergebnis der Alters-Sensitivitätsanalyse
+
+Der QIC des nichtlinearen Altersmodells beträgt ungefähr 580 und liegt damit 
+deutlich unter dem QIC des linearen Altersmodells von ungefähr 602.
+
+Dies spricht dafür, dass die Annahme eines linearen Alterseffekts auf der 
+Logit-Skala möglicherweise zu stark vereinfachend ist. Der Zusammenhang 
+zwischen Alter und der Wahrscheinlichkeit eines guten Atemwegsstatus könnte 
+stattdessen gekrümmt oder in verschiedenen Altersbereichen unterschiedlich 
+sein.
+
+Der niedrigere QIC ist kein Beweis dafür, dass das nichtlineare Modell die 
+wahre Struktur der Daten darstellt. Er liefert jedoch einen deutlichen 
+Hinweis, dass die Altersmodellierung die Anpassung beeinflusst. Deshalb 
+führen wir eine Sensitivitätsanalyse durch und vergleichen den 
+Behandlungseffekt zwischen dem linearen und dem nichtlinearen Altersmodell.
+
+Die zehn größten Pearson-Residuals liegen betragsmäßig ungefähr zwischen 
+1,61 und 1,73. Diese Werte sind nicht automatisch problematisch. Sie zeigen 
+einzelne Beobachtungen, bei denen der beobachtete Atemwegsstatus vom 
+Modellwert abweicht. Bei einem binären Outcome sind solche Abweichungen 
+erwartbar.
+
+Die auffälligsten Residuen treten überwiegend bei Personen auf, bei denen 
+das Modell eine relativ hohe Wahrscheinlichkeit für einen guten Status 
+vorhersagt, tatsächlich aber `outcome = 0` beobachtet wurde. Das ist eine 
+Modellabweichung, aber kein Beweis für fehlerhafte Daten.
+
+Entscheidend ist, dass wir keine Beobachtungen nur aufgrund eines größeren 
+Residiums entfernen. Zunächst wird geprüft, ob es sich um plausible 
+klinische Beobachtungen handelt. In diesem Datensatz gibt es keinen 
+automatischen Grund, diese Beobachtungen auszuschließen.
+
+### Konsequenz für das finale Modell
+
+Da das nichtlineare Altersmodell eine deutlich bessere QIC-Anpassung zeigt, 
+berichten wir das lineare Altersmodell nicht mehr als einzige Spezifikation. 
+Wir vergleichen den Behandlungseffekt in beiden Modellen und prüfen, ob die 
+zentrale Schlussfolgerung stabil bleibt.
+
+Wenn die Odds Ratio der Behandlung in beiden Modellen ähnlich bleibt, ist der 
+Behandlungseffekt robust gegenüber der Modellierung des Alters. Wenn sie sich 
+deutlich verändert, muss die Altersmodellierung bei der Interpretation 
+besonders berücksichtigt werden.
+
+## Vergleich des Behandlungseffekts unter linearer und nichtlinearer Altersmodellierung
+
+```{r}
+gee_final_nonlinear_age <- geeglm(
+  outcome ~ treat + visit_factor + ns(age, df = 2) + sex,
+  id = person_id,
+  data = respiratory,
+  family = binomial(link = "logit"),
+  corstr = "exchangeable"
+)
+
+vergleich_alter_behandlung <- bind_rows(
+  gee_final_results %>%
+    filter(Term == "treatP") %>%
+    transmute(
+      Modell = "Lineares Altersmodell",
+      Odds_Ratio,
+      KI_unten,
+      KI_oben,
+      p_wert
+    ),
+  tibble(
+    Modell = "Nichtlineares Altersmodell",
+    Odds_Ratio = exp(coef(gee_final_nonlinear_age)["treatP"]),
+    KI_unten = exp(
+      coef(gee_final_nonlinear_age)["treatP"] -
+        1.96 * summary(gee_final_nonlinear_age)$coefficients[
+          "treatP", "Std.err"
+        ]
+    ),
+    KI_oben = exp(
+      coef(gee_final_nonlinear_age)["treatP"] +
+        1.96 * summary(gee_final_nonlinear_age)$coefficients[
+          "treatP", "Std.err"
+        ]
+    ),
+    p_wert = summary(gee_final_nonlinear_age)$coefficients[
+      "treatP", "Pr(>|W|)"
+    ]
+  )
+)
+
+vergleich_alter_behandlung
+```
+
+### Interpretation der Sensitivitätsanalyse
+
+Die Behandlungsschätzung wird zwischen zwei plausiblen 
+Altersmodellierungen verglichen. Das lineare Modell ist leichter zu 
+interpretieren, während das nichtlineare Modell die Altersstruktur flexibler 
+abbildet.
+
+Die Wahl des endgültigen Modells berücksichtigt daher nicht nur den kleinsten 
+QIC-Wert, sondern auch die Stabilität des Behandlungseffekts, die fachliche 
+Interpretierbarkeit und die begrenzte Stichprobengröße.
+
+### Interpretation der Sensitivitätsanalyse zur Altersmodellierung
+
+Der Vergleich zeigt folgende Behandlungsschätzungen:
+
+| Modell | Odds Ratio für Placebo | 95-%-KI | p-Wert |
+|---|---:|---:|---:|
+| Lineares Altersmodell | 0,368 | 0,196–0,691 | 0,00186 |
+| Nichtlineares Altersmodell | 0,352 | 0,186–0,664 | 0,00127 |
+
+Das nichtlineare Altersmodell weist einen deutlich niedrigeren QIC auf 
+(ungefähr 580 gegenüber ungefähr 602). Dies spricht dafür, dass es die 
+Altersstruktur der Daten besser abbildet als das lineare Modell.
+
+Entscheidend ist jedoch, dass sich die Behandlungsschätzung durch die 
+flexiblere Modellierung des Alters nur geringfügig verändert. Die Odds Ratio 
+ändert sich von 0,368 auf 0,352. Beide Konfidenzintervalle liegen vollständig 
+unter 1 und beide p-Werte sind kleiner als 0,05.
+
+#### Statistische Bedeutung
+
+Die zentrale Schlussfolgerung ist robust gegenüber der Modellierung des 
+Alters. Sowohl das lineare als auch das nichtlineare Altersmodell zeigen 
+niedrigere Odds für einen guten Atemwegsstatus in der Placebogruppe gegenüber 
+der aktiven Behandlungsgruppe.
+
+Im nichtlinearen Modell beträgt die Odds Ratio 0,352. Die Odds für einen 
+guten Atemwegsstatus sind im Placebo damit geschätzt etwa 64,8 % niedriger 
+als unter der aktiven Behandlung:
+
+\[
+1 - 0{,}352 = 0{,}648.
+\]
+
+Der niedrigere QIC spricht für das nichtlineare Altersmodell als besser 
+passende Spezifikation. Die Stabilität der Behandlungsschätzung zeigt 
+jedoch, dass die Hauptergebnisse nicht von der linearen Altersannahme 
+abhängen.
+
+#### Medizinische Bedeutung
+
+Medizinisch bleibt der Behandlungsvorteil der aktiven Behandlung bestehen, 
+auch wenn der Zusammenhang zwischen Alter und Atemwegsstatus flexibler 
+modelliert wird.
+
+Das bedeutet: Die Schlussfolgerung, dass die aktive Behandlung mit höheren 
+Odds für einen guten Atemwegsstatus verbunden ist, wird nicht wesentlich 
+durch eine möglicherweise nichtlineare Alterswirkung erklärt.
+
+#### Konsequenz für die weitere Analyse
+
+Für die endgültige Modellierung verwenden wir das nichtlineare Altersmodell 
+als bevorzugte Sensitivitätsspezifikation, weil es den niedrigeren QIC-Wert aufweist. Das lineare Altersmodell bleibt als Vergleich im Bericht 
+dokumentiert.
+
+Die Behandlungsschätzung wird im endgültigen Ergebnis als robust bezeichnet, weil sie unter beiden Altersmodellierungen nahezu gleich bleibt.
+
+Der QIC ist dabei ein Modellvergleichskriterium und kein Beweis für die 
+Wahrheit eines Modells. Die endgültige Entscheidung berücksichtigt zusätzlich 
+die medizinische Fragestellung, die Stichprobengröße, die Interpretierbarkeit 
+und die Stabilität der Behandlungsschätzung.
+
+#### Einordnung für Ärztinnen und Ärzte
+
+Die aktive Behandlung zeigt auch bei einer flexibleren Modellierung des Alters einen statistisch deutlichen Vorteil gegenüber dem Placebo. Die 
+Behandlungsschätzung bleibt dabei nahezu unverändert.
+
+Das spricht dafür, dass das Ergebnis nicht lediglich durch die Annahme eines linearen Alterseffekts entstanden ist. Gleichzeitig bleibt die Aussage auf den untersuchten Datensatz und die gewählte Modellstruktur begrenzt.
+
+#### Fazit
+
+Die Sensitivitätsanalyse zeigt, dass die Modellwahl aktiv geprüft wurde. Ein nichtlinearer Alterseffekt wurde zugelassen, weil der QIC eine bessere 
+Modellanpassung nahelegte. Anschließend wurde überprüft, ob sich der zentrale Behandlungseffekt verändert.
+
+Da die Behandlungsschätzung stabil blieb, ist das Hauptergebnis robust 
+gegenüber dieser Modellierungsentscheidung. Dies zeigt einen 
+reproduzierbaren Umgang mit Modellannahmen und Sensitivitätsanalysen.
+
+## 6. Endgültige Modellauswahl
+
+Die Sensitivitätsanalyse verglich ein Modell mit linearem Alter mit einem Modell,das den Alterseffekt nichtlinear abbildet.
+
+Das nichtlineare Modell zeigte den niedrigeren QIC-Wert und beschreibt die Daten daher nach diesem Kriterium besser. Der geschätzte Behandlungseffekt blieb jedoch nahezu unverändert:
+
+- lineares Altersmodell: OR = 0.368, p = 0.00186
+- nichtlineares Altersmodell: OR = 0.352, p = 0.00127
+
+Damit ist die zentrale Schlussfolgerung robust gegenüber der Modellierung des Alters.Unter Placebo waren die Odds für einen guten Atemwegsstatus niedriger als unter der aktiven Behandlung.
+
+Für die abschließende Interpretation verwenden wir deshalb das GEE-Modell mit nichtlinearer Altersfunktion. Dieses Modell berücksichtigt sowohl die wiederholten Messungen innerhalb einer Person als auch einen möglichen nichtlinearen Zusammenhang zwischen Alter und Atemwegsstatus.
+
+# Diskussion und Grenzen
+
+## 7. Diskussion und Grenzen
+
+Die Analyse zeigt einen Unterschied zwischen aktiver Behandlung und Placebo.
+
+Dieser Unterschied war in den zeitpunktbezogenen Vergleichen teilweise sichtbar und blieb auch im gemeinsamen GEE-Modell nach Berücksichtigung wiederholter Messungen bestehen.
+
+Die Analyse ist jedoch explorativ. Die Daten enthalten nur 111 Personen und
+vier Messzeitpunkte. Außerdem ist das Geschlecht in der Stichprobe ungleich
+verteilt. Die Ergebnisse sind daher nicht automatisch auf andere Populationen
+übertragbar.
+
+Die GEE-Analyse berücksichtigt die Abhängigkeit wiederholter Messungen innerhalb
+derselben Person. Sie liefert jedoch keine individuelle Vorhersage für einzelne Patientinnen oder Patienten. Die Behandlungsergebnisse sollten deshalb als Gruppenvergleich interpretiert werden.
+
+Die Korrekturen für multiples Testen beziehen sich auf die vier zeitpunktbezogenen Einzeltests. Sie ersetzen nicht das gemeinsame longitudinale Modell. Die Einzeltests und das GEE-Modell beantworten unterschiedliche Fragen:
+
+- Die Einzeltests untersuchen Unterschiede zu jedem Besuch separat.
+- Das GEE-Modell untersucht den Behandlungseffekt über alle Besuche gemeinsam.
+
+## 8. Fazit
+
+In diesem Projekt wurde eine öffentliche longitudinale Studie mit binärem
+Atemwegsstatus analysiert. Zunächst wurden die Ergebnisse deskriptiv nach
+Behandlung und Besuch dargestellt. Anschließend wurden vier zeitpunktbezogene Gruppenvergleiche mit Bonferroni-, Holm-, Benjamini-Hochberg- und
+Benjamini-Yekutieli-Korrektur ausgewertet.
+
+Da jede Person mehrfach untersucht wurde, wurde für die Hauptanalyse ein
+GEE-Modell verwendet. Dieses berücksichtigt die Abhängigkeit der Messungen
+innerhalb einer Person.
+
+Die aktive Behandlung zeigte im Vergleich zum Placebo höhere Odds für einen gutenAtemwegsstatus. Dieser Befund blieb auch nach Berücksichtigung von Alter,
+Geschlecht und der wiederholten Messstruktur bestehen. Die Schlussfolgerung war außerdem robust gegenüber einer linearen oder nichtlinearen Modellierung des Alters.
+
+Die Ergebnisse sind als explorative Gruppenvergleiche zu verstehen und nicht als individuelle Therapieempfehlung.
+
+# Fazit
+
+Die vier Korrekturverfahren führten zu unterschiedlichen Entscheidungen:
+
+- Mit der strengeren Bonferroni-Korrektur waren die Besuche 2 und 3 statistisch signifikant.
+- Die Holm-Korrektur führte zur gleichen Entscheidung wie Bonferroni.
+- Mit der Benjamini-Hochberg-Korrektur waren die Besuche 1 und 2 signifikant.
+- Die Benjamini-Yekutieli-Korrektur identifizierte die Besuche 2 und 3 als signifikant.
+
+Bonferroni und Holm kontrollieren die Familywise Error Rate. Sie begrenzen damit die Wahrscheinlichkeit, innerhalb der gesamten Testfamilie mindestens einen falsch positiven Befund zu erhalten.
+
+Benjamini-Hochberg und Benjamini-Yekutieli kontrollieren dagegen die False Discovery Rate. Sie erlauben bei explorativen Fragestellungen eine höhere Teststärke, beziehen sich aber auf den erwarteten Anteil falscher Entdeckungen unter den verworfenen Nullhypothesen.
+
+Die unterschiedlichen Ergebnisse zeigen, dass die Schlussfolgerung von der
+gewählten Fehlerkontrolle abhängen kann. Deshalb sollte nicht nur berichtet werden,welche p-Werte signifikant sind, sondern auch, welches Korrekturverfahren verwendet wurde und ob die Analyse eher bestätigend oder explorativ ist.
+
+Für die gemeinsame Hauptanalyse wurde anschließend ein GEE-Modell verwendet.
+Dieses berücksichtigt die Abhängigkeit der wiederholten Messungen innerhalb einer Person und ist deshalb für die longitudinale Struktur der Daten besser geeignet als vier voneinander unabhängige Tests.
+
+### Einfluss der Korrektur auf die Schlussfolgerung
+
+Vor der Korrektur waren drei von vier Besuchen signifikant:
+
+| Besuch | Roh-p-Wert | Rohentscheidung |
+|---|---:|---|
+| 1 | 0,0381 | signifikant |
+| 2 | 0,000787 | signifikant |
+| 3 | 0,00445 | signifikant |
+| 4 | 0,0690 | nicht signifikant |
+
+Nach der Korrektur:
+
+| Verfahren | Signifikante Besuche |
+|---|---|
+| Bonferroni | 2 und 3 |
+| Holm | 2 und 3 |
+| Benjamini–Hochberg | 1 und 2 |
+| Benjamini–Yekutieli | 2 und 3 |
+
+Der wichtigste Unterschied betrifft Besuch 1:
+
+- Roh-p-Wert: signifikant
+- nach Bonferroni: nicht mehr signifikant
+- nach Holm: nicht mehr signifikant
+- nach Benjamini–Hochberg: weiterhin signifikant
+- nach Benjamini–Yekutieli: nicht mehr signifikant
+
+Besuch 4 bleibt bei allen Verfahren nicht signifikant.
+
+**Statistische Bedeutung:**  
+Die Korrektur verändert die Entscheidung für Besuch 1. Ohne Korrektur würde
+Besuch 1 als statistisch auffällig gelten. Nach den FWER-kontrollierenden
+Verfahren Bonferroni und Holm ist dieser Befund nicht mehr signifikant.
+Benjamini–Hochberg bleibt als FDR-Verfahren weniger streng und bewertet Besuch 1 weiterhin als signifikant.
+
+**Medizinische Bedeutung:**  
+Der Unterschied zwischen den Behandlungsgruppen ist bei Besuch 2 am robustesten.
+Der Befund bei Besuch 1 ist dagegen weniger stabil und hängt von der gewählten Fehlerkontrolle ab. Er sollte deshalb nicht als eindeutiger Behandlungseffekt interpretiert werden.
+
+**Konsequenz für die weitere Analyse:**  
+Die Wahl des Korrekturverfahrens muss zusammen mit der Forschungsfrage begründet werden. 
+Für eine bestätigende Aussage ist die strengere FWER-Kontrolle angemessen.
+Für eine explorative Untersuchung kann die FDR-Kontrolle zusätzliche mögliche Signale sichtbar machen.
+
+**Einordnung für Ärztinnen, Ärzte**  
+Die Analyse zeigt, dass mehrere statistische Tests zu scheinbar signifikanten Ergebnissen führen können. Erst durch die Korrektur wird sichtbar, welche Befunde gegenüber diesem Problem robust bleiben.
+
+
